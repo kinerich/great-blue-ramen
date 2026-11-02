@@ -40,3 +40,7 @@ yarn-error.*
 /ios
 /android
 .vercel
+_expo/
+favicon.ico
+index.html
+metadata.json

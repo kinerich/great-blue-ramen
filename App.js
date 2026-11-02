@@ -11,8 +11,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
    Free Gemini API key: https://aistudio.google.com/apikey
    If you get a "model not found" error, change MODEL. */
 const MODEL = 'gemini-flash-latest';
-const KEY_STORE = 'grokbot:apikey';
-const DATA_STORE = 'grokbot:data';
+const KEY_STORE = 'autokinetics:apikey';
+const DATA_STORE = 'autokinetics:data';
 
 const CATS = [
   { id: 'academics', name: 'Academics', icon: '📚', color: '#60A5FA', focus: 'study systems, learning, exams, reading, deep work' },
