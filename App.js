@@ -83,7 +83,7 @@ const buildSystem = (mode, tasks, habits, profile = {}, memory = []) => {
   const hb = habits.map((h) => `- [${h.cat}] ${h.title} (streak ${streakOf(h.log)}, done today: ${h.log.includes(dayKey(0))})`).join('\n') || '(none)';
   const me = [['Name', profile.name], ['Situation', profile.situation], ['Goals', profile.goals], ['Weaknesses', profile.weaknesses], ['Strengths', profile.strengths], ['Routine and values', profile.routine]]
     .filter(([, v]) => v && v.trim()).map(([k, v]) => `${k}: ${v.trim()}`).join('\n') || '(not filled in yet: gently ask the user to complete their profile)';
-  return `You are Grokbot, an elite personal coach whose mission is to make the user a genius-level, superhuman performer: smarter, stronger, more disciplined and more successful across six pillars: ${CATS.map((x) => x.name).join(', ')}. Hold them to a superhuman standard with evidence-based methods (deliberate practice, spaced repetition, sleep, progressive overload, deep work) and give honest feedback, not flattery. ${c ? `Current focus: ${c.name} (${c.focus}).` : 'Balance all four pillars.'}
+  return `You are AutoKinetics, an elite personal coach whose mission is to make the user a genius-level, superhuman performer: smarter, stronger, more disciplined and more successful across six pillars: ${CATS.map((x) => x.name).join(', ')}. Hold them to a superhuman standard with evidence-based methods (deliberate practice, spaced repetition, sleep, progressive overload, deep work) and give honest feedback, not flattery. ${c ? `Current focus: ${c.name} (${c.focus}).` : 'Balance all four pillars.'}
 Be direct, motivating and practical, never preachy. Use short checklists and time-blocked plans. Ask at most 3 short questions when you need details. For health topics give general guidance and suggest a professional for medical concerns. Never invent facts about the user.
 Date: ${new Date().toString()}
 Open tasks:
@@ -366,7 +366,7 @@ function Gate({ end, onFocus, onOverride }) {
     <View style={s.gate}>
       <Text style={s.bigIcon}>🔒</Text>
       <Text style={s.h1}>Peak window locked</Text>
-      <Text style={[s.muted, { textAlign: 'center', marginVertical: 12, maxWidth: 380 }]}>Heavy work only until {end}. This unlocks by itself. Locks apply inside Grokbot only.</Text>
+      <Text style={[s.muted, { textAlign: 'center', marginVertical: 12, maxWidth: 380 }]}>Heavy work only until {end}. This unlocks by itself. Locks apply inside AutoKinetics only.</Text>
       <Pressable onPress={onFocus} style={[s.wide, { backgroundColor: C.accent, maxWidth: 300 }]}><Text style={s.addBtnText}>Start deep focus</Text></Pressable>
       <Pressable onPress={onOverride} style={[s.wide, { backgroundColor: '#17171A', marginTop: 8, maxWidth: 300 }]}><Text style={s.ghostText}>Override</Text></Pressable>
     </View>
@@ -1007,7 +1007,7 @@ export default function App() {
         {!online && <View style={s.offlineBanner}><Text style={s.offlineText}>Offline Mode</Text></View>}
 
         <View style={s.header}>
-          <Text style={s.brand}>Grokbot</Text>
+          <Text style={s.brand}>AutoKinetics</Text>
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
             {online && (
               <View style={s.badge}><View style={s.badgeDot} /><Text style={s.badgeText}>Online</Text></View>
