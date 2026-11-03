@@ -6,21 +6,21 @@ import {
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import NetInfo from '@react-native-community/netinfo';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Ionicons } from '@expo/vector-icons';
 
 /* ---------- Config ----------
-   Free Gemini API key: https://aistudio.google.com/apikey
-   If you get a "model not found" error, change MODEL. */
-const MODEL = 'gemini-flash-latest';
-const KEY_STORE = 'grokbot:apikey';
-const DATA_STORE = 'grokbot:data';
+   Free OpenRouter key: https://openrouter.ai/keys (no card needed).
+   Free models are limited to ~20 requests/min and ~50 requests/day per account. */
+const KEY_STORE = 'autokinetics:orkey';
+const DATA_STORE = 'autokinetics:data';
 
 const CATS = [
-  { id: 'academics', name: 'Academics', icon: '📚', color: '#60A5FA', focus: 'study systems, learning, exams, reading, deep work' },
-  { id: 'mind', name: 'Mind', icon: '🧠', color: '#C084FC', focus: 'focus, stress, journaling, sleep, emotional resilience' },
-  { id: 'body', name: 'Body', icon: '💪', color: '#34D399', focus: 'training, nutrition, sleep, recovery, energy' },
-  { id: 'discipline', name: 'Discipline', icon: '🎯', color: '#FBBF24', focus: 'routines, willpower, time management, consistency' },
-  { id: 'career', name: 'Career', icon: '💼', color: '#FB923C', focus: 'skills, income, projects, networking, financial habits' },
-  { id: 'social', name: 'Social', icon: '🤝', color: '#F472B6', focus: 'communication, relationships, leadership, confidence' },
+  { id: 'academics', name: 'Academics', icon: 'school-outline', color: '#60A5FA', focus: 'study systems, learning, exams, reading, deep work' },
+  { id: 'mind', name: 'Mind', icon: 'bulb-outline', color: '#C084FC', focus: 'focus, stress, journaling, sleep, emotional resilience' },
+  { id: 'body', name: 'Body', icon: 'barbell-outline', color: '#34D399', focus: 'training, nutrition, sleep, recovery, energy' },
+  { id: 'discipline', name: 'Discipline', icon: 'locate-outline', color: '#FBBF24', focus: 'routines, willpower, time management, consistency' },
+  { id: 'career', name: 'Career', icon: 'briefcase-outline', color: '#FB923C', focus: 'skills, income, projects, networking, financial habits' },
+  { id: 'social', name: 'Social', icon: 'people-outline', color: '#F472B6', focus: 'communication, relationships, leadership, confidence' },
 ];
 const catOf = (id) => CATS.find((c) => c.id === id) || CATS[3];
 const RANKS = ['Rookie', 'Apprentice', 'Disciplined', 'Sharp', 'Elite', 'Superior', 'Genius', 'Superhuman'];
@@ -83,7 +83,7 @@ const buildSystem = (mode, tasks, habits, profile = {}, memory = []) => {
   const hb = habits.map((h) => `- [${h.cat}] ${h.title} (streak ${streakOf(h.log)}, done today: ${h.log.includes(dayKey(0))})`).join('\n') || '(none)';
   const me = [['Name', profile.name], ['Situation', profile.situation], ['Goals', profile.goals], ['Weaknesses', profile.weaknesses], ['Strengths', profile.strengths], ['Routine and values', profile.routine]]
     .filter(([, v]) => v && v.trim()).map(([k, v]) => `${k}: ${v.trim()}`).join('\n') || '(not filled in yet: gently ask the user to complete their profile)';
-  return `You are AutoKinetics, an elite personal coach whose mission is to make the user a genius-level, superhuman performer: smarter, stronger, more disciplined and more successful across six pillars: ${CATS.map((x) => x.name).join(', ')}. Hold them to a superhuman standard with evidence-based methods (deliberate practice, spaced repetition, sleep, progressive overload, deep work) and give honest feedback, not flattery. ${c ? `Current focus: ${c.name} (${c.focus}).` : 'Balance all four pillars.'}
+  return `You are AutoKinetics, an elite personal coach whose mission is to make the user a genius-level, superhuman performer: smarter, stronger, more disciplined and more successful across six pillars: ${CATS.map((x) => x.name).join(', ')}. Hold them to a superhuman standard with evidence-based methods (deliberate practice, spaced repetition, sleep, progressive overload, deep work) and give honest feedback, not flattery. ${c ? `Current focus: ${c.name} (${c.focus}).` : 'Balance all six pillars.'}
 Be direct, motivating and practical, never preachy. Use short checklists and time-blocked plans. Ask at most 3 short questions when you need details. For health topics give general guidance and suggest a professional for medical concerns. Never invent facts about the user.
 Date: ${new Date().toString()}
 Open tasks:
@@ -97,24 +97,68 @@ ${memory.length ? memory.map((f) => `- ${f}`).join('\n') : '(none yet)'}
 When you learn a new lasting fact about the user, end your reply with [[remember: short fact]] (one tag per fact, only if genuinely new).`;
 };
 
-async function askGemini(apiKey, history, system) {
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: system }] },
-      contents: history.slice(-30).map((m) => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: m.text }] })),
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    if (res.status === 429) throw new Error('Free limit reached. Wait a minute and try again.');
-    if (res.status === 400 || res.status === 403) throw new Error('Google rejected the request. Check your API key in settings.');
-    throw new Error(data?.error?.message || `Request failed (${res.status})`);
+const API = 'https://openrouter.ai/api/v1';
+let freePool = null; // cached list of currently free models
+async function loadFreePool() {
+  if (freePool) return freePool;
+  try {
+    const j = await (await fetch(`${API}/models`)).json();
+    const pref = ['llama', 'qwen', 'gpt-oss', 'mistral', 'gemma', 'deepseek'];
+    const rank = (id) => { const i = pref.findIndex((x) => id.includes(x)); return i < 0 ? 99 : i; };
+    freePool = (j.data || [])
+      .filter((m) => m.id.endsWith(':free') && !/coder|guard|embed|rerank|image/i.test(m.id) && (m.architecture?.output_modalities || ['text']).includes('text'))
+      .sort((a, b) => rank(a.id) - rank(b.id) || (b.context_length || 0) - (a.context_length || 0))
+      .map((m) => m.id);
+  } catch (e) { freePool = []; }
+  return freePool;
+}
+
+async function callOnce(apiKey, model, messages) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 40000);
+  try {
+    const res = await fetch(`${API}/chat/completions`, {
+      method: 'POST',
+      signal: ctl.signal,
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://autokinetics.app', 'X-Title': 'AutoKinetics' },
+      body: JSON.stringify({ model, messages, max_tokens: 1200 }),
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) {}
+    if (res.ok && !data.error) {
+      const text = String(data?.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+      return text ? { text } : { status: 0, msg: 'empty' };
+    }
+    return { status: Number(data?.error?.code) || res.status, msg: String(data?.error?.message || '') };
+  } catch (e) {
+    return { status: 0, msg: e.name === 'AbortError' ? 'timeout' : 'network' };
+  } finally { clearTimeout(timer); }
+}
+
+// Tries the free router first, then falls back across currently-free models.
+async function askAI(apiKey, history, system) {
+  const turns = history.slice(-30).map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.text }));
+  while (turns.length && turns[0].role !== 'user') turns.shift();
+  const withSys = [{ role: 'system', content: system }, ...turns];
+  const merged = turns.map((t, i) => (i === 0 ? { ...t, content: `${system}\n\n${t.content}` } : t));
+  const attempt = async (model) => {
+    let r = await callOnce(apiKey, model, withSys);
+    if (r.status === 400) r = await callOnce(apiKey, model, merged); // some models reject system prompts
+    if (r.status === 401) throw new Error('OpenRouter rejected your key. Re-copy it in settings (it starts with sk-or-).');
+    if (r.status === 402) throw new Error('OpenRouter reports a negative balance. Free models need a balance of zero or more.');
+    if (r.status === 429 && /per-day|daily/i.test(r.msg)) throw new Error('Daily free limit reached (about 50 free messages per day). It resets around 00:00 UTC.');
+    if (r.status === 429 && /per-min/i.test(r.msg)) throw new Error('You hit the free limit of 20 requests per minute. Wait 30 seconds and retry.');
+    return r.text;
+  };
+  for (const model of ['openrouter/free', 'openrouter/free']) {
+    const t = await attempt(model);
+    if (t) return t;
   }
-  const text = (data?.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
-  if (!text) throw new Error('The model sent an empty reply. Try again.');
-  return text;
+  for (const model of (await loadFreePool()).slice(0, 4)) {
+    const t = await attempt(model);
+    if (t) return t;
+  }
+  throw new Error('All free models are busy right now. Wait a minute and try again.');
 }
 
 function useIsOnline() {
@@ -129,16 +173,39 @@ const C = {
   accent: '#F4F4F5', onAccent: '#000', online: '#22C55E', offline: '#DC2626', disabled: '#3A3A3F',
 };
 
+const Icon = ({ n, size = 20, color = C.text, style }) => <Ionicons name={n} size={size} color={color} style={style} />;
+
+function Logo() {
+  return (
+    <View style={s.logoRow}>
+      <View style={s.logoMark}><Icon n="pulse" size={18} color={C.onAccent} /></View>
+      <Text style={s.brand}>Auto<Text style={{ color: C.muted }}>Kinetics</Text></Text>
+    </View>
+  );
+}
+
+const Bubble = React.memo(({ item }) => {
+  const u = item.role === 'user';
+  return (
+    <View style={[s.row, { justifyContent: u ? 'flex-end' : 'flex-start' }]}>
+      <View style={[s.bubble, u ? s.bubbleU : s.bubbleA, item.error && { borderColor: C.offline }]}>
+        <Text style={[s.bubbleText, item.error && { color: '#F87171' }]}>{item.text}</Text>
+      </View>
+    </View>
+  );
+});
+const renderBubble = ({ item }) => <Bubble item={item} />;
+
 /* ---------- Small components ---------- */
 function CatChips({ value, onChange, withAll }) {
-  const list = withAll ? [{ id: 'all', name: 'All', icon: '✨', color: C.text }, ...CATS] : CATS;
+  const list = withAll ? [{ id: 'all', name: 'All', icon: 'sparkles-outline', color: C.text }, ...CATS] : CATS;
   return (
     <View style={s.chipRow}>
       {list.map((c) => {
         const on = value === c.id;
         return (
           <Pressable key={c.id} onPress={() => onChange(c.id)} style={[s.chip, on && { borderColor: c.color, backgroundColor: C.raised }]}>
-            <Text style={[s.chipText, on && { color: c.color }]}>{c.icon} {c.name}</Text>
+            <View style={s.btnRow}><Icon n={c.icon} size={16} color={on ? c.color : C.muted} /><Text style={[s.chipText, { marginLeft: 6 }, on && { color: c.color }]}>{c.name}</Text></View>
           </Pressable>
         );
       })}
@@ -186,7 +253,7 @@ function Today({ tasks, habits, xp, online, activity, focusMin, meta, setMeta, p
       <View style={s.pillarRow}>
         {pillars.map(({ c, total, done }) => (
           <View key={c.id} style={s.pillar}>
-            <Text style={s.pillarIcon}>{c.icon}</Text>
+            <Icon n={c.icon} size={22} color={c.color} />
             <View style={s.track}><View style={[s.fill, { width: `${total ? (done / total) * 100 : 0}%`, backgroundColor: c.color }]} /></View>
             <Text style={s.pillarText}>{done}/{total}</Text>
           </View>
@@ -211,10 +278,10 @@ function Today({ tasks, habits, xp, online, activity, focusMin, meta, setMeta, p
       </View>
 
       <Pressable onPress={onUrge} style={[s.planBtn, { borderColor: '#5B1F1F' }]}>
-        <Text style={s.planText}>🛑 Urge to scroll? Pause first ({meta.urges} resisted)</Text>
+        <View style={s.btnRow}><Icon n="hand-left-outline" size={18} color="#F87171" /><Text style={[s.planText, { marginLeft: 8 }]}>Urge to scroll? Pause first ({meta.urges} resisted)</Text></View>
       </Pressable>
       <Pressable disabled={!online} onPress={onPlan} style={[s.planBtn, !online && { opacity: 0.4 }]}>
-        <Text style={s.planText}>{online ? '🤖 Ask Coach to plan my day' : 'Coach planning needs a connection'}</Text>
+        <View style={s.btnRow}><Icon n="sparkles-outline" size={18} /><Text style={[s.planText, { marginLeft: 8 }]}>{online ? 'Ask Coach to plan my day' : 'Coach planning needs a connection'}</Text></View>
       </Pressable>
 
       <Text style={s.section}>Tasks</Text>
@@ -226,11 +293,11 @@ function Today({ tasks, habits, xp, online, activity, focusMin, meta, setMeta, p
         return (
           <View key={t.id} style={s.item}>
             <Pressable onPress={() => onToggle(t.id)} style={[s.check, { borderColor: c.color }, t.done && { backgroundColor: c.color }]}>
-              {t.done && <Text style={s.tick}>✓</Text>}
+              {t.done && <Icon n="checkmark" size={16} color="#000" />}
             </Pressable>
             <Text style={[s.itemText, t.done && s.done]}>{t.title}</Text>
-            <Text style={s.itemIcon}>{c.icon}</Text>
-            <Pressable onPress={() => onDelete(t.id)} hitSlop={10}><Text style={s.x}>✕</Text></Pressable>
+            <Icon n={c.icon} size={18} color={c.color} style={{ marginHorizontal: 10 }} />
+            <Pressable onPress={() => onDelete(t.id)} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable>
           </View>
         );
       })}
@@ -255,18 +322,18 @@ function Habits({ habits, onToggle, onAdd, onDelete }) {
         return (
           <View key={h.id} style={s.card}>
             <View style={s.between}>
-              <Text style={s.habitTitle}>{c.icon} {h.title}</Text>
-              <Pressable onPress={() => onDelete(h.id)} hitSlop={10}><Text style={s.x}>✕</Text></Pressable>
+              <View style={[s.btnRow, { flex: 1, justifyContent: 'flex-start' }]}><Icon n={c.icon} size={20} color={c.color} /><Text style={[s.habitTitle, { marginLeft: 8 }]}>{h.title}</Text></View>
+              <Pressable onPress={() => onDelete(h.id)} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable>
             </View>
             <View style={[s.between, { marginTop: 12 }]}>
               <View style={{ flexDirection: 'row' }}>
                 {[6, 5, 4, 3, 2, 1, 0].map((i) => (
                   <View key={i} style={[s.dot, h.log.includes(dayKey(-i)) && { backgroundColor: c.color, borderColor: c.color }]} />
                 ))}
-                <Text style={[s.muted, { marginLeft: 8 }]}>🔥 {streakOf(h.log)} day streak</Text>
+                <Icon n="flame" size={15} color="#FB923C" style={{ marginLeft: 8, marginRight: 3 }} /><Text style={s.muted}>{streakOf(h.log)} day streak</Text>
               </View>
               <Pressable onPress={() => onToggle(h.id)} style={[s.logBtn, doneToday && { backgroundColor: c.color, borderColor: c.color }]}>
-                <Text style={[s.logText, doneToday && { color: '#000' }]}>{doneToday ? 'Done ✓' : 'Check in'}</Text>
+                <Text style={[s.logText, doneToday && { color: '#000' }]}>{doneToday ? 'Done' : 'Check in'}</Text>
               </Pressable>
             </View>
           </View>
@@ -290,7 +357,7 @@ function Shield({ visible, context, onChoose }) {
     <Modal visible={visible} transparent animationType="fade">
       <View style={s.backdrop}>
         <View style={[s.modal, { alignItems: 'center' }]}>
-          <Text style={s.bigIcon}>🛑</Text>
+          <View style={s.bigIconWrap}><Icon n="hand-left-outline" size={32} color="#F87171" /></View>
           <Text style={s.h1}>Pause.</Text>
           <Text style={[s.muted, { textAlign: 'center', marginVertical: 10 }]}>{context}</Text>
           <Text style={[s.habitTitle, { textAlign: 'center', flex: 0 }]}>Is this asset-building or dopamine-chasing?</Text>
@@ -314,7 +381,7 @@ function MicroQuiz({ card, onRate, onClose }) {
     <Modal visible={!!card} transparent animationType="fade" onRequestClose={onClose}>
       <View style={s.backdrop}>
         <View style={s.modal}>
-          <View style={s.between}><Text style={s.muted}>🃏 Quick recall</Text><Pressable onPress={onClose} hitSlop={10}><Text style={s.x}>✕</Text></Pressable></View>
+          <View style={s.between}><View style={s.btnRow}><Icon n="albums-outline" size={16} color={C.muted} /><Text style={[s.muted, { marginLeft: 6 }]}>Quick recall</Text></View><Pressable onPress={onClose} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable></View>
           <Text style={s.bigQ}>{card ? card.q : ''}</Text>
           {show && card ? <Text style={[s.itemText, { marginTop: 14 }]}>{card.a}</Text> : null}
           {!show ? (
@@ -348,14 +415,14 @@ function PeakCard({ meta, setMeta, pk, inPeak }) {
   );
   return (
     <View style={[s.card, inPeak && { borderColor: C.accent }]}>
-      <Text style={s.muted}>⚡ Peak cognitive window</Text>
+      <View style={[s.btnRow, { justifyContent: 'flex-start' }]}><Icon n="flash-outline" size={16} color={C.muted} /><Text style={[s.muted, { marginLeft: 6 }]}>Peak cognitive window</Text></View>
       <Text style={s.h1}>{fmt(pk.start)} – {fmt(pk.end)}</Text>
       <Text style={[s.muted, { marginTop: 4 }]}>{status}</Text>
       <Row label="Sleep last night (h)" val={Math.round(sleep)} onPick={(v) => setMeta((m) => ({ ...m, sleep: { ...m.sleep, [dayKey(0)]: v } }))} />
       <Row label="Wake time (am)" val={meta.wake} onPick={(v) => setMeta((m) => ({ ...m, wake: v }))} />
       <Text style={[s.muted, { marginTop: 8, fontSize: 12 }]}>{pk.learned ? 'Learned from when you actually finish focus sessions.' : 'Estimated from wake time and sleep. Learns your real peak after 3 focus sessions.'}</Text>
       <Pressable onPress={() => setMeta((m) => ({ ...m, lock: !m.lock }))} style={[s.logBtn, { alignSelf: 'flex-start', marginTop: 10 }, meta.lock && { borderColor: C.accent }]}>
-        <Text style={s.logText}>🔒 Peak Lock: {meta.lock ? 'ON' : 'OFF'}</Text>
+        <View style={s.btnRow}><Icon n={meta.lock ? 'lock-closed' : 'lock-open-outline'} size={14} /><Text style={[s.logText, { marginLeft: 6 }]}>Peak Lock: {meta.lock ? 'ON' : 'OFF'}</Text></View>
       </Pressable>
     </View>
   );
@@ -364,7 +431,7 @@ function PeakCard({ meta, setMeta, pk, inPeak }) {
 function Gate({ end, onFocus, onOverride }) {
   return (
     <View style={s.gate}>
-      <Text style={s.bigIcon}>🔒</Text>
+      <View style={s.bigIconWrap}><Icon n="lock-closed-outline" size={32} /></View>
       <Text style={s.h1}>Peak window locked</Text>
       <Text style={[s.muted, { textAlign: 'center', marginVertical: 12, maxWidth: 380 }]}>Heavy work only until {end}. This unlocks by itself. Locks apply inside AutoKinetics only.</Text>
       <Pressable onPress={onFocus} style={[s.wide, { backgroundColor: C.accent, maxWidth: 300 }]}><Text style={s.addBtnText}>Start deep focus</Text></Pressable>
@@ -394,7 +461,7 @@ function MomentumCard({ habits }) {
       </View>
       <Text style={[s.muted, { marginTop: 10 }]}>
         {m.n === 0 ? 'Add habits to start building momentum.'
-          : m.recovery ? `Never miss twice: today only needs ${m.needed} of ${m.n} habits to protect your momentum. ${m.done >= m.needed ? 'Target met ✓' : `${m.done}/${m.needed} done.`}`
+          : m.recovery ? `Never miss twice: today only needs ${m.needed} of ${m.n} habits to protect your momentum. ${m.done >= m.needed ? 'Target met' : `${m.done}/${m.needed} done.`}`
           : `Today's target: ${m.done}/${m.n}. Missing one day costs little. Missing two compounds.`}
       </Text>
     </View>
@@ -416,7 +483,7 @@ function Learn({ cards, setCards, online, apiKey, onReview, onOpenSettings }) {
     if (!apiKey) return onOpenSettings();
     setBusy(true); setErr('');
     try {
-      const t = await askGemini(apiKey, [{ role: 'user', text: `Topic: ${topic.trim()}` }], 'Create 8 high-quality flashcards that build deep understanding of the topic. Reply with ONLY a JSON array like [{"q":"question","a":"short answer"}]. No markdown.');
+      const t = await askAI(apiKey, [{ role: 'user', text: `Topic: ${topic.trim()}` }], 'Create 8 high-quality flashcards that build deep understanding of the topic. Reply with ONLY a JSON array like [{"q":"question","a":"short answer"}]. No markdown.');
       const arr = JSON.parse(t.slice(t.indexOf('['), t.lastIndexOf(']') + 1));
       setCards((cs) => [...arr.filter((x) => x.q && x.a).map((x) => ({ id: uid(), q: String(x.q), a: String(x.a), box: 0, due: dayKey(0) })), ...cs]);
       setTopic('');
@@ -442,7 +509,7 @@ function Learn({ cards, setCards, online, apiKey, onReview, onOpenSettings }) {
         <View key={c.id} style={s.item}>
           <Text style={s.itemText}>{c.q}</Text>
           <Text style={s.muted}>Lv {c.box + 1}</Text>
-          <Pressable onPress={() => setCards((cs) => cs.filter((x) => x.id !== c.id))} hitSlop={10}><Text style={[s.x, { marginLeft: 12 }]}>✕</Text></Pressable>
+          <Pressable onPress={() => setCards((cs) => cs.filter((x) => x.id !== c.id))} hitSlop={10}><Icon n="close" size={18} color={C.muted} style={{ marginLeft: 12 }} /></Pressable>
         </View>
       ))}
     </ScrollView>
@@ -471,7 +538,7 @@ function Dump({ meta, onDump }) {
       {res && <Text style={[s.empty, { color: C.online }]}>+{res.actions.length} actions in Today · {res.models.length} models · {res.archive.length} archived</Text>}
       <Text style={s.section}>Mental models</Text>
       {meta.models.length === 0 && <Text style={s.empty}>Insights and rules you write will collect here.</Text>}
-      {meta.models.slice(0, 15).map((m, i) => <View key={i} style={s.item}><Text style={s.itemText}>💡 {m}</Text></View>)}
+      {meta.models.slice(0, 15).map((m, i) => <View key={i} style={s.item}><Icon n="bulb-outline" size={18} color="#FBBF24" style={{ marginRight: 10 }} /><Text style={s.itemText}>{m}</Text></View>)}
       <Text style={s.section}>Archive</Text>
       {meta.archive.slice(0, 10).map((m, i) => <Text key={i} style={[s.muted, { marginBottom: 6 }]}>• {m}</Text>)}
     </ScrollView>
@@ -513,7 +580,7 @@ function ReactionTest({ rt, onSave }) {
   };
   return (
     <View style={s.card}>
-      <Text style={s.habitTitle}>⚡ Reaction time</Text>
+      <View style={s.btnRow}><Icon n="flash-outline" size={18} /><Text style={[s.habitTitle, { flex: 0, marginLeft: 8 }]}>Reaction time</Text></View>
       <Pressable onPress={press} style={[s.testBox, { backgroundColor: st === 'go' ? '#16A34A' : st === 'wait' ? '#B91C1C' : C.raised }]}>
         <Text style={s.testText}>{st === 'idle' ? (last ? `${last} · tap to retry` : 'Tap to start') : st === 'wait' ? 'Wait for green…' : 'TAP NOW'}</Text>
       </Pressable>
@@ -538,7 +605,7 @@ function SpanTest({ best, onResult }) {
   };
   return (
     <View style={s.card}>
-      <Text style={s.habitTitle}>🧠 Working memory (digit span) · best {best || 0}</Text>
+      <View style={s.btnRow}><Icon n="bulb-outline" size={18} /><Text style={[s.habitTitle, { flex: 0, marginLeft: 8 }]}>Working memory · best span {best || 0}</Text></View>
       {phase === 'show' && <Text style={s.digits}>{seq}</Text>}
       {phase === 'input' && (
         <View style={s.addRow}>
@@ -601,7 +668,7 @@ function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onAnalyz
         <Text style={s.habitTitle}>Daily check-in</Text>
         <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 10 }}>
           <Text style={[s.muted, { width: 70 }]}>Mood</Text>
-          {['😞', '😕', '😐', '🙂', '😄'].map((e, i) => (
+          {[1, 2, 3, 4, 5].map((e, i) => (
             <Pressable key={e} onPress={() => setMood('m', i + 1)} style={[s.mini, mood.m === i + 1 && { borderColor: C.accent, backgroundColor: C.raised }]}><Text style={s.chipText}>{e}</Text></Pressable>
           ))}
         </View>
@@ -647,7 +714,7 @@ function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onAnalyz
         <Text style={s.habitTitle}>Effort by pillar (14 days)</Text>
         {m.eff.map(({ c, v }) => (
           <View key={c.id} style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8 }}>
-            <Text style={{ width: 28, fontSize: 16 }}>{c.icon}</Text>
+            <View style={{ width: 30 }}><Icon n={c.icon} size={18} color={c.color} /></View>
             <View style={[s.track, { flex: 1, marginVertical: 0 }]}><View style={[s.fill, { width: `${m.tot ? (v / m.tot) * 100 : 0}%`, backgroundColor: c.color }]} /></View>
             <Text style={[s.muted, { width: 30, textAlign: 'right' }]}>{v}</Text>
           </View>
@@ -671,7 +738,7 @@ function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onAnalyz
       <SpanTest best={meta.span} onResult={(n) => setMeta((mt) => ({ ...mt, span: Math.max(mt.span || 0, n) }))} />
 
       <Pressable disabled={!online} onPress={() => onAnalyze(summary)} style={[s.wide, { backgroundColor: C.accent, opacity: online ? 1 : 0.4, maxWidth: '100%' }]}>
-        <Text style={s.addBtnText}>{online ? '🤖 AI performance review of my stats' : 'AI review needs a connection'}</Text>
+        <View style={s.btnRow}><Icon n="sparkles-outline" size={18} color={C.onAccent} /><Text style={[s.addBtnText, { marginLeft: 8 }]}>{online ? 'AI performance review of my stats' : 'AI review needs a connection'}</Text></View>
       </Pressable>
     </ScrollView>
   );
@@ -764,8 +831,8 @@ function Me({ profile, setProfile, memory, setMemory }) {
       {memory.length === 0 && <Text style={s.empty}>No memories yet. Chat with your coach and it will start learning.</Text>}
       {memory.map((f) => (
         <View key={f} style={s.item}>
-          <Text style={s.itemText}>🧩 {f}</Text>
-          <Pressable onPress={() => setMemory((m) => m.filter((x) => x !== f))} hitSlop={10}><Text style={s.x}>✕</Text></Pressable>
+          <Icon n="bookmark-outline" size={18} color={C.muted} style={{ marginRight: 10 }} /><Text style={s.itemText}>{f}</Text>
+          <Pressable onPress={() => setMemory((m) => m.filter((x) => x !== f))} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable>
         </View>
       ))}
     </ScrollView>
@@ -789,22 +856,16 @@ function Coach({ online, hasKey, messages, thinking, mode, setMode, onSend, onOp
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
         onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
-        renderItem={({ item }) => {
-          const u = item.role === 'user';
-          return (
-            <View style={[s.row, { justifyContent: u ? 'flex-end' : 'flex-start' }]}>
-              <View style={[s.bubble, u ? s.bubbleU : s.bubbleA, item.error && { borderColor: C.offline }]}>
-                <Text style={[s.bubbleText, item.error && { color: '#F87171' }]}>{item.text}</Text>
-              </View>
-            </View>
-          );
-        }}
+        renderItem={renderBubble}
+        initialNumToRender={12}
+        windowSize={7}
+        removeClippedSubviews
         ListEmptyComponent={
           <View style={s.hero}>
             <Text style={s.heroTitle}>Become better, every day.</Text>
             <Text style={s.heroSub}>Your coach knows your tasks and habits. Pick a pillar above, then ask.</Text>
             {!hasKey && (
-              <Pressable onPress={onOpenSettings} style={s.keyCta}><Text style={s.keyCtaText}>Add your free Gemini key to start</Text></Pressable>
+              <Pressable onPress={onOpenSettings} style={s.keyCta}><Text style={s.keyCtaText}>Add your free OpenRouter key to start</Text></Pressable>
             )}
             {PROMPTS[mode].map((p) => (
               <Pressable key={p} disabled={!online} onPress={() => go(p)} style={[s.suggest, !online && { opacity: 0.4 }]}>
@@ -827,7 +888,7 @@ function Coach({ online, hasKey, messages, thinking, mode, setMode, onSend, onOp
           />
           <Pressable onPress={() => go(input)} disabled={!canSend} accessibilityLabel="Send message"
             style={[s.send, { backgroundColor: canSend ? C.accent : C.disabled }]}>
-            <Text style={[s.sendIcon, !canSend && { color: '#6B6B73' }]}>↑</Text>
+            <Icon n="arrow-up" size={20} color={canSend ? C.onAccent : '#6B6B73'} />
           </Pressable>
         </View>
       </View>
@@ -837,23 +898,25 @@ function Coach({ online, hasKey, messages, thinking, mode, setMode, onSend, onOp
 
 function SettingsModal({ visible, apiKey, onSave, onClear, onClose }) {
   const [draft, setDraft] = useState(apiKey);
-  useEffect(() => setDraft(apiKey), [apiKey, visible]);
+  const [err, setErr] = useState('');
+  useEffect(() => { setDraft(apiKey); setErr(''); }, [apiKey, visible]);
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <KeyboardAvoidingView style={s.backdrop} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <View style={s.modal}>
           <Text style={s.h1}>Settings</Text>
-          <Text style={[s.muted, { marginTop: 16, marginBottom: 8 }]}>Gemini API key</Text>
-          <TextInput style={s.keyInput} value={draft} onChangeText={setDraft} placeholder="Paste key from aistudio.google.com/apikey"
+          <Text style={[s.muted, { marginTop: 16, marginBottom: 8 }]}>OpenRouter API key</Text>
+          <TextInput style={s.keyInput} value={draft} onChangeText={setDraft} placeholder="Paste key (starts with sk-or-)"
             placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} secureTextEntry keyboardAppearance="dark" />
           <Text style={[s.muted, { marginTop: 12, fontSize: 13 }]}>
-            Stored only on this device. Free-tier prompts may be used by Google to improve its products, so keep sensitive details out of chats.
+            Stored only on this device. Get a free key at openrouter.ai/keys. Free models are run by third-party providers that may log or train on prompts, so keep sensitive details out of chats.
           </Text>
+          {!!err && <Text style={[s.muted, { color: '#F87171', marginTop: 8 }]}>{err}</Text>}
           <View style={[s.between, { marginTop: 20 }]}>
             <Pressable style={s.ghost} onPress={onClear}><Text style={[s.ghostText, { color: '#F87171' }]}>Clear chat</Text></Pressable>
             <View style={{ flexDirection: 'row' }}>
               <Pressable style={s.ghost} onPress={onClose}><Text style={s.ghostText}>Close</Text></Pressable>
-              <Pressable style={[s.ghost, { backgroundColor: C.accent, marginLeft: 8 }]} onPress={() => onSave(draft.trim())}>
+              <Pressable style={[s.ghost, { backgroundColor: C.accent, marginLeft: 8 }]} onPress={() => { const k = draft.trim(); if (k && !k.startsWith('sk-or-')) return setErr('That does not look like an OpenRouter key. It should start with sk-or-.'); setErr(''); onSave(k); }}>
                 <Text style={[s.ghostText, { color: C.onAccent }]}>Save key</Text>
               </Pressable>
             </View>
@@ -897,7 +960,8 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [k, d] = await Promise.all([AsyncStorage.getItem(KEY_STORE), AsyncStorage.getItem(DATA_STORE)]);
+        const k = await AsyncStorage.getItem(KEY_STORE);
+        const d = (await AsyncStorage.getItem(DATA_STORE)) || (await AsyncStorage.getItem('grokbot:data'));
         if (k) setApiKey(k);
         if (d) {
           const p = JSON.parse(d);
@@ -979,7 +1043,7 @@ export default function App() {
     setMessages((p) => [...p, u]); // instant user bubble
     setThinking(true);
     try {
-      const reply = await askGemini(apiKey, history, buildSystem(mode, tasks, habits, profile, memory));
+      const reply = await askAI(apiKey, history, buildSystem(mode, tasks, habits, profile, memory));
       const facts = [...reply.matchAll(/\[\[remember:\s*([\s\S]+?)\]\]/gi)].map((m) => m[1].trim());
       const clean = reply.replace(/\[\[remember:[\s\S]*?\]\]/gi, '').trim() || reply;
       if (facts.length) setMemory((m) => [...new Set([...m, ...facts])].slice(-40));
@@ -998,7 +1062,7 @@ export default function App() {
   };
 
   const view = meta.lock && inPeak && !override && ['habits', 'coach', 'me', 'learn'].includes(tab) ? 'gate' : tab;
-  const TABS = [{ id: 'today', icon: '✅', label: 'Today' }, { id: 'habits', icon: '🔥', label: 'Habits' }, { id: 'focus', icon: '⏱', label: 'Focus' }, { id: 'learn', icon: '🃏', label: 'Learn' }, { id: 'dump', icon: '🌀', label: 'Dump' }, { id: 'stats', icon: '📊', label: 'Stats' }, { id: 'coach', icon: '🤖', label: 'Coach' }, { id: 'me', icon: '🧬', label: 'Me' }];
+  const TABS = [{ id: 'today', icon: 'checkmark-circle', label: 'Today' }, { id: 'habits', icon: 'flame', label: 'Habits' }, { id: 'focus', icon: 'timer', label: 'Focus' }, { id: 'learn', icon: 'albums', label: 'Learn' }, { id: 'dump', icon: 'create', label: 'Dump' }, { id: 'stats', icon: 'stats-chart', label: 'Stats' }, { id: 'coach', icon: 'chatbubble-ellipses', label: 'Coach' }, { id: 'me', icon: 'person', label: 'Me' }];
 
   return (
     <SafeAreaProvider>
@@ -1007,12 +1071,12 @@ export default function App() {
         {!online && <View style={s.offlineBanner}><Text style={s.offlineText}>Offline Mode</Text></View>}
 
         <View style={s.header}>
-          <Text style={s.brand}>AutoKinetics</Text>
+          <Logo />
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
             {online && (
               <View style={s.badge}><View style={s.badgeDot} /><Text style={s.badgeText}>Online</Text></View>
             )}
-            <Pressable onPress={() => setShowSettings(true)} style={s.gear} accessibilityLabel="Settings"><Text style={s.gearText}>⚙</Text></Pressable>
+            <Pressable onPress={() => setShowSettings(true)} style={s.gear} accessibilityLabel="Settings"><Icon n="settings-outline" size={22} color={C.muted} /></Pressable>
           </View>
         </View>
 
@@ -1041,7 +1105,7 @@ export default function App() {
         <View style={s.tabBar}>
           {TABS.map((t) => (
             <Pressable key={t.id} onPress={() => setTab(t.id)} style={s.tab}>
-              <Text style={[s.tabIcon, tab !== t.id && { opacity: 0.45 }]}>{t.icon}</Text>
+              <Icon n={tab === t.id ? t.icon : `${t.icon}-outline`} size={22} color={tab === t.id ? C.text : C.muted} />
               <Text style={[s.tabLabel, tab === t.id && { color: C.text }]}>{t.label}</Text>
             </Pressable>
           ))}
@@ -1147,6 +1211,10 @@ const s = StyleSheet.create({
   testBox: { height: 120, borderRadius: 16, alignItems: 'center', justifyContent: 'center', marginTop: 12 },
   testText: { color: '#fff', fontSize: 20, fontWeight: '700' },
   digits: { color: C.text, fontSize: 48, fontWeight: '700', letterSpacing: 8, textAlign: 'center', marginVertical: 24 },
+  logoRow: { flexDirection: 'row', alignItems: 'center' },
+  logoMark: { width: 30, height: 30, borderRadius: 9, backgroundColor: C.accent, alignItems: 'center', justifyContent: 'center', marginRight: 10 },
+  bigIconWrap: { width: 68, height: 68, borderRadius: 34, backgroundColor: C.raised, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
+  btnRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
   gate: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
   bigIcon: { fontSize: 48, marginBottom: 8 },
   bigQ: { color: C.text, fontSize: 24, fontWeight: '700', lineHeight: 30, marginTop: 14 },
