@@ -1,9 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AppState, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView,
-  StatusBar, StyleSheet, Text, TextInput, View,
+  Share, StatusBar, StyleSheet, Text, TextInput, Vibration, View,
 } from 'react-native';
-import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import NetInfo from '@react-native-community/netinfo';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
@@ -48,7 +48,7 @@ const streakOf = (log) => {
   return n;
 };
 const INTERVALS = [0, 1, 2, 4, 8, 16, 32];
-const fmt = (h) => { const hh = Math.floor(h) % 24; return `${hh % 12 || 12}:${h % 1 ? '30' : '00'} ${hh < 12 ? 'AM' : 'PM'}`; };
+const fmt = (h) => { const t = Math.round((((h % 24) + 24) % 24) * 60), hh = Math.floor(t / 60) % 24; return `${hh % 12 || 12}:${pad(t % 60)} ${hh < 12 ? 'AM' : 'PM'}`; };
 const dayRatio = (habits, off) => (habits.length ? habits.filter((h) => h.log.includes(dayKey(off))).length / habits.length : 0);
 const velocity = (habits) => {
   let num = 0, den = 0;
@@ -59,7 +59,7 @@ const velocity = (habits) => {
 const peakWindow = (meta) => {
   const hrs = meta.hours || {}, total = Object.values(hrs).reduce((a, b) => a + b, 0);
   const best = Object.keys(hrs).sort((a, b) => hrs[b] - hrs[a])[0];
-  const sleep = (meta.sleep || {})[dayKey(0)] ?? 7, short = sleep < 6;
+  const sleep = sleepNow(meta) ?? 7, short = sleep < 6;
   const learned = total >= 3 && best !== undefined;
   const start = (learned ? +best : meta.wake + 2) + (short ? 1 : 0);
   return { start, end: start + (short ? 1.5 : 2), learned };
@@ -77,9 +77,223 @@ const parseDump = (raw) => {
 };
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36);
 
-const buildSystem = (mode, tasks, habits, profile = {}, memory = []) => {
+/* ---------- Extra helpers (plans, sleep, score, badges) ---------- */
+const norm = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+const sameish = (a, b) => { a = norm(a); b = norm(b); return !!a && !!b && (a === b || (Math.min(a.length, b.length) >= 5 && (a.includes(b) || b.includes(a)))); };
+const daysBetween = (a, b) => Math.round((new Date(b + 'T12:00:00') - new Date(a + 'T12:00:00')) / 864e5);
+const hm = (h) => { const t = Math.round(h * 60); return `${Math.floor(t / 60)}h ${pad(t % 60)}m`; };
+const keyOf = (ts) => { const d = new Date(ts); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+const dLabel = (k) => { const d = new Date(k + 'T12:00:00'); return `${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()]} ${d.getMonth() + 1}/${d.getDate()}`; };
+const timeOf = (ts) => { if (!ts) return ''; const d = new Date(ts), t = fmt(d.getHours() + d.getMinutes() / 60); return d.toDateString() === new Date().toDateString() ? t : `${d.getMonth() + 1}/${d.getDate()} ${t}`; };
+const prunePlans = (pl) => Object.fromEntries(Object.entries(pl).sort(([a], [b]) => b.localeCompare(a)).slice(0, 30));
+
+const GUESS = [
+  ['body', /workout|gym|run|walk|stretch|lift|exercise|yoga|meal|lunch|breakfast|dinner|protein|swim|cardio|nap/i],
+  ['academics', /study|read|class|lecture|exam|homework|revise|learn|course|assignment|essay|flashcard/i],
+  ['mind', /meditat|journal|breath|reflect|gratitude|reset|mindful|wind.?down/i],
+  ['career', /work|project|code|coding|email|client|job|resume|portfolio|invoice|budget|income|skill|business/i],
+  ['social', /call|friend|family|date|chat|meet|network|mentor|volunteer/i],
+];
+const guessCat = (t) => (GUESS.find(([, re]) => re.test(t)) || ['discipline'])[0];
+
+const JOURNAL_PROMPTS = [
+  'What went well today, and why?',
+  'What did you avoid today, and what was the real reason?',
+  'What did you learn today that you want to keep?',
+  'What drained your energy? What gave you energy?',
+  'What is the one thing that would make tomorrow a win?',
+  'What would the best version of you have done differently today?',
+  'Who helped you recently, and how can you thank them?',
+];
+
+/* Plan detection and parsing: the Coach answers with a [[plan]] JSON block that gets applied across the app. */
+const PLAN_RE = /\b(?:plan(?:ning)?|schedul(?:e|ing)|organi[sz]e|time[- ]?block(?:ing)?)\s+(?:out\s+)?(?:(?:my|the|for|me|a)\s+)*(?:(?:whole|entire)\s+)?(?:day|today|tomorrow)\b/i;
+const planOffset = (t) => (/\btomorrow\b/i.test(t) ? 1 : /\btoday\b/i.test(t) ? 0 : new Date().getHours() >= 21 ? 1 : 0);
+const PLAN_TAG = /\[\[plan\]\]([\s\S]*?)(?:\[\[\/plan\]\]|$)/i;
+const TIME_LINE = /^[\s>*\u2022-]*(?:\d+[.)]\s+)?\**\s*(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?m\.?)?)\s*(?:-|\u2013|\u2014|to)\s*(\d{1,2}(?::\d{2})?\s*(?:[ap]\.?m\.?)?)\**\s*[:|\u2013\u2014-]?\s*\**\s*(.+)$/i;
+
+const toH = (x) => {
+  if (typeof x === 'number') return Number.isFinite(x) && x >= 0 && x <= 24 ? x : null;
+  const m = String(x == null ? '' : x).trim().match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])?\.?m?\.?$/i);
+  if (!m) return null;
+  let h = +m[1];
+  const mi = m[2] ? +m[2] : 0, ap = m[3] && m[3].toLowerCase();
+  if (mi > 59) return null;
+  if (ap === 'p' && h < 12) h += 12;
+  if (ap === 'a' && h === 12) h = 0;
+  const v = h + mi / 60;
+  return v > 24 ? null : v;
+};
+const clean1 = (x, n) => String(x == null ? '' : x).replace(/[*_`#]+/g, '').replace(/\s+/g, ' ').trim().slice(0, n);
+const validCat = (c) => CATS.some((x) => x.id === c);
+
+function normPlan(blocks, tasks, focus) {
+  const seen = new Set();
+  const bl = blocks.map((b) => {
+    const st = toH(b.start);
+    if (st === null || st >= 24) return null;
+    let en = b.end != null ? toH(b.end) : null;
+    if (en === null || en <= st) en = Math.min(24, st + 0.5);
+    const title = clean1(b.title, 70);
+    if (!title) return null;
+    return { start: st, end: en, title, cat: validCat(b.cat) ? b.cat : guessCat(title), ref: clean1(b.ref, 80) };
+  }).filter(Boolean).sort((a, b) => a.start - b.start)
+    .filter((b) => { const k = `${b.start}|${norm(b.title)}`; if (seen.has(k)) return false; seen.add(k); return true; })
+    .slice(0, 14);
+  if (bl.length < 2) return null;
+  const ts = [], tseen = new Set();
+  tasks.forEach((t) => {
+    const title = clean1(t.title, 80);
+    if (title && !tseen.has(norm(title)) && ts.length < 4) { tseen.add(norm(title)); ts.push({ title, cat: validCat(t.cat) ? t.cat : guessCat(title) }); }
+  });
+  return { focus: clean1(focus, 140), blocks: bl, tasks: ts };
+}
+
+const meridian = (x) => (/[ap]/i.exec(String(x).replace(/[\d:\s.]/g, '')) || [''])[0].toLowerCase();
+const textPlan = (text) => {
+  const out = [];
+  text.split('\n').forEach((line) => {
+    const m = line.match(TIME_LINE);
+    if (!m) return;
+    let a = m[1], b = m[2];
+    const ma = meridian(a), mb = meridian(b);
+    if (!ma && mb) a += `${mb}m`; else if (ma && !mb) b += `${ma}m`;
+    let st = toH(a);
+    const en = toH(b);
+    if (st === null || en === null) return;
+    if (en <= st && !ma && mb) st -= 12;
+    out.push({ start: st, end: en, title: m[3] });
+  });
+  return out;
+};
+
+function extractPlan(reply) {
+  const m = reply.match(PLAN_TAG);
+  let text = reply.replace(PLAN_TAG, '').replace(/```(?:json)?\s*```/gi, '').trim();
+  const src = m ? m[1] : reply;
+  const objs = (src.match(/\{[^{}]*\}/g) || []).map((x) => { try { return JSON.parse(x); } catch (e) { return null; } }).filter((o) => o && o.title);
+  const blocks = objs.filter((o) => o.start != null), tasks = m ? objs.filter((o) => o.start == null) : [];
+  const fm = src.match(/"focus"\s*:\s*"([^"]{1,160})"/);
+  let plan = blocks.length >= 2 ? normPlan(blocks, tasks, fm ? fm[1] : '') : null;
+  if (plan && !m) text = text.replace(/```(?:json)?[\s\S]*?```/gi, '').trim();
+  if (!plan) { const tb = textPlan(text); if (tb.length >= 3) plan = normPlan(tb, [], ''); }
+  return { text: text || 'Your plan is ready.', plan };
+}
+
+const planRules = (label, date, now, off, bed) => `PLAN MODE: the user wants a plan for ${label} (${date}). ${off ? '' : `It is ${fmt(now)} now, so schedule only from now onward. `}Reply with at most 3 short coaching sentences, then output the plan in exactly this format (valid JSON, 24-hour "HH:MM" times, 6 to 12 blocks, no overlaps, between wake time and the target bedtime ${fmt(bed)}):
+[[plan]]{"focus":"the one outcome that matters most","blocks":[{"start":"07:00","end":"07:45","title":"Short title","cat":"body","ref":"exact title of an existing task or habit this block completes (omit if none)"}],"tasks":[{"title":"new task worth adding","cat":"career"}]}[[/plan]]
+Rules: cat is one of academics, mind, body, discipline, career, social. Put the hardest work inside the peak window. Include meals, breaks and a wind-down block before bed. Use the user's real open tasks, habits and goals, and set ref only to an exact existing title. Add at most 4 new tasks, only for important things missing from the list. Adapt to sleep: if last night was under 6 hours, do not stack heavy work early. Do not repeat the schedule in prose.`;
+
+/* Sleep */
+const sleepNow = (meta) => {
+  const sl = meta.sleep || {};
+  if (sl[dayKey(0)] != null) return sl[dayKey(0)];
+  const r = [1, 2, 3].map((i) => sl[dayKey(-i)]).filter((v) => v != null);
+  return r.length ? sum(r) / r.length : null;
+};
+const spreadMin = (vals) => {
+  if (vals.length < 3) return null;
+  const mu = sum(vals) / vals.length;
+  return Math.round(Math.sqrt(sum(vals.map((v) => (v - mu) ** 2)) / vals.length) * 60);
+};
+const sleepInfo = (meta) => {
+  const sl = meta.sleep || {}, lg = meta.sleepLog || {}, target = meta.sleepTarget || 8;
+  const n7 = lastDays(7).map((d) => sl[d]).filter((v) => v != null);
+  const detail = lastDays(14).map((d) => lg[d]).filter(Boolean);
+  const rel = detail.map((x) => (x.bed - 18 + 24) % 24);
+  const avgRel = rel.length ? sum(rel) / rel.length : null;
+  const avgWake = detail.length ? sum(detail.map((x) => x.wake)) / detail.length : meta.wake;
+  return {
+    target, last: sl[dayKey(0)] ?? null, n7: n7.length, avg7: n7.length ? sum(n7) / n7.length : null,
+    debt: sum(n7.map((v) => Math.max(0, target - v))), spread: spreadMin(rel),
+    avgBed: avgRel === null ? null : (avgRel + 18) % 24, avgWake,
+    bedTonight: (((avgWake - target) % 24) + 24) % 24,
+  };
+};
+const sleepEdge = (meta, activity) => {
+  const sl = meta.sleep || {}, ks = Object.keys(sl);
+  const avg = (a) => (a.length ? sum(a.map((k) => activity[k] || 0)) / a.length : 0);
+  const hi = ks.filter((k) => sl[k] >= 7), lo = ks.filter((k) => sl[k] < 7);
+  return hi.length && lo.length ? avg(hi) - avg(lo) : null;
+};
+
+/* Day score: one number blending habits, plan or tasks, focus, water and sleep */
+const dayScore = (tasks, habits, meta, plan) => {
+  const t = dayKey(0), hd = habits.filter((h) => h.log.includes(t)).length;
+  const doneT = tasks.filter((x) => x.done && x.doneOn === t).length, openT = tasks.filter((x) => !x.done).length;
+  const pb = plan ? plan.blocks.length : 0, pd = plan ? plan.blocks.filter((b) => b.done).length : 0;
+  const focus = (meta.focusDays || {})[t] || 0, water = (meta.water || {})[t] || 0, wg = meta.waterGoal || 8, sl = (meta.sleep || {})[t];
+  const parts = [
+    habits.length && { w: 30, v: hd / habits.length, txt: `Habits ${hd}/${habits.length}` },
+    pb ? { w: 30, v: pd / pb, txt: `Plan ${pd}/${pb}` } : (doneT + openT) && { w: 30, v: doneT / (doneT + openT), txt: `Tasks ${doneT}/${doneT + openT}` },
+    { w: 20, v: clamp(focus / 50), txt: `Focus ${focus}m` },
+    { w: 10, v: clamp(water / wg), txt: `Water ${water}/${wg}` },
+    { w: 10, v: sl == null ? 0 : clamp(sl / (meta.sleepTarget || 8)), txt: sl == null ? 'Sleep not logged' : `Sleep ${sl.toFixed(1)}h` },
+  ].filter(Boolean);
+  const tw = sum(parts.map((p) => p.w));
+  return { score: Math.round((100 * sum(parts.map((p) => p.w * p.v))) / tw), txt: parts.map((p) => p.txt).join(' · ') };
+};
+
+/* Smart nudges: rule-based, work offline */
+const nudges = ({ meta, habits, cards, plan, pk, inPeak, online }) => {
+  const d = new Date(), now = d.getHours() + d.getMinutes() / 60, si = sleepInfo(meta), out = [], t = dayKey(0);
+  const left = habits.filter((h) => !h.log.includes(t)).length, water = (meta.water || {})[t] || 0, wg = meta.waterGoal || 8;
+  const toBed = (((si.bedTonight - now) % 24) + 24) % 24, past = (((now - si.bedTonight) % 24) + 24) % 24;
+  if (meta.sleepStart) out.push({ icon: 'moon', text: 'Sleep timer is running. Open Sleep when you wake up.', go: 'sleep' });
+  else if ((meta.sleep || {})[t] == null && now >= 6 && now < 14) out.push({ icon: 'bed-outline', text: `Log last night's sleep so your analytics stay accurate.`, go: 'sleep' });
+  if (toBed <= 1.5) out.push({ icon: 'moon-outline', text: `Bedtime in ${Math.round(toBed * 60)} min. Start winding down.`, go: 'sleep' });
+  else if (past <= 3) out.push({ icon: 'moon', text: `Past your ${fmt(si.bedTonight)} bedtime. Sleep now: tomorrow's output depends on it.`, go: 'sleep' });
+  if (inPeak) out.push({ icon: 'flash', text: `You are in your peak window until ${fmt(pk.end)}. Do the hardest task now.`, go: 'focus' });
+  else if (pk.start > now && pk.start - now <= 0.5) out.push({ icon: 'flash-outline', text: `Peak window starts in ${Math.round((pk.start - now) * 60)} min. Line up your hardest task.`, go: 'focus' });
+  const cur = plan && plan.blocks.find((b) => !b.done && b.start <= now && now < b.end);
+  if (cur) out.push({ icon: 'time-outline', text: `Now: ${cur.title} (until ${fmt(cur.end)})`, go: 'focus' });
+  if (!plan && online && now < 20) out.push({ icon: 'sparkles-outline', text: 'No plan for today yet. Let Coach build one and apply it here.', go: 'plan' });
+  if (left && now >= 18) out.push({ icon: 'flame-outline', text: `${left} habit${left > 1 ? 's' : ''} left today. Protect your streak.`, go: 'habits' });
+  if (water < wg / 2 && now >= 14) out.push({ icon: 'water-outline', text: `Water is low: ${water}/${wg}.`, go: null });
+  const due = cards.filter((c) => c.due <= t).length;
+  if (due) out.push({ icon: 'albums-outline', text: `${due} flashcard${due > 1 ? 's' : ''} due for review.`, go: 'learn' });
+  return out.slice(0, 2);
+};
+
+/* Badges: derived from your data, nothing extra to store except which ones were announced */
+const badgeDefs = (xp, focusMin, habits, cards, meta) => {
+  const sl = meta.sleep || {}, tg = meta.sleepTarget || 8, plans = Object.values(meta.plans || {}), wg = meta.waterGoal || 8;
+  const best = Math.max(0, ...habits.map((h) => longest(h.log)));
+  const lvl = Math.floor(xp / 100) + 1;
+  return [
+    { id: 'lvl2', icon: 'rocket-outline', name: 'Liftoff', desc: 'Reach level 2', cur: lvl, need: 2 },
+    { id: 'lvl5', icon: 'trending-up-outline', name: 'Climber', desc: 'Reach level 5', cur: lvl, need: 5 },
+    { id: 'focus5', icon: 'timer-outline', name: 'Deep Worker', desc: '5 hours of deep focus', cur: Math.floor(focusMin / 60), need: 5 },
+    { id: 'focus20', icon: 'infinite-outline', name: 'Flow State', desc: '20 hours of deep focus', cur: Math.floor(focusMin / 60), need: 20 },
+    { id: 'streak7', icon: 'flame-outline', name: 'On Fire', desc: '7-day habit streak', cur: best, need: 7 },
+    { id: 'streak30', icon: 'shield-checkmark-outline', name: 'Unbreakable', desc: '30-day habit streak', cur: best, need: 30 },
+    { id: 'sleep7', icon: 'moon-outline', name: 'Sleep Logger', desc: 'Log 7 nights of sleep', cur: Object.keys(sl).length, need: 7 },
+    { id: 'rested', icon: 'bed-outline', name: 'Well Rested', desc: `5 nights of ${tg}h or more`, cur: Object.values(sl).filter((v) => v >= tg).length, need: 5 },
+    { id: 'plan3', icon: 'calendar-outline', name: 'Planner', desc: 'Finish 70% of 3 daily plans', cur: plans.filter((p) => p.blocks.length && p.blocks.filter((b) => b.done).length / p.blocks.length >= 0.7).length, need: 3 },
+    { id: 'water5', icon: 'water-outline', name: 'Hydrated', desc: 'Hit your water goal 5 days', cur: Object.values(meta.water || {}).filter((v) => v >= wg).length, need: 5 },
+    { id: 'journal7', icon: 'book-outline', name: 'Reflective', desc: 'Write 7 journal entries', cur: (meta.journal || []).length, need: 7 },
+    { id: 'cards10', icon: 'albums-outline', name: 'Memory Master', desc: 'Master 10 flashcards', cur: cards.filter((c) => c.box >= 4).length, need: 10 },
+    { id: 'urge10', icon: 'hand-left-outline', name: 'Impulse Master', desc: 'Resist 10 urges', cur: meta.urges || 0, need: 10 },
+    { id: 'goal1', icon: 'trophy-outline', name: 'Goal Getter', desc: 'Complete a goal', cur: (meta.goals || []).filter((g) => g.done).length, need: 1 },
+  ].map((b) => ({ ...b, ok: b.cur >= b.need }));
+};
+
+const listItems = (text) => text.split('\n')
+  .map((l) => l.match(/^\s*(?:[-*\u2022]|\d+[.)]|\[ ?\])\s+(.{4,120})$/))
+  .filter(Boolean)
+  .map((m) => m[1].replace(/\*+/g, '').replace(/[:\uFF1A]\s*$/, '').trim())
+  .filter((x) => x.length >= 4)
+  .slice(0, 8);
+
+const DEFAULT_META = {
+  wake: 7, lock: false, sleep: {}, sleepLog: {}, sleepStart: null, sleepTarget: 8, hours: {}, urges: 0, slips: 0,
+  models: [], archive: [], focusDays: {}, focusLog: [], reviews: { ok: 0, n: 0 }, mood: {}, rt: [], span: 0,
+  plans: {}, water: {}, waterGoal: 8, journal: [], goals: [], badges: [], chatKeep: 60,
+};
+
+const buildSystem = (mode, tasks, habits, profile = {}, memory = [], ctx = {}) => {
   const c = mode === 'all' ? null : catOf(mode);
-  const open = tasks.filter((t) => !t.done).map((t) => `- [${t.cat}] ${t.title}`).join('\n') || '(none)';
+  const open = tasks.filter((t) => !t.done).map((t) => `- [${t.cat}] ${t.title}${t.star ? ' (PRIORITY)' : ''}`).join('\n') || '(none)';
   const hb = habits.map((h) => `- [${h.cat}] ${h.title} (streak ${streakOf(h.log)}, done today: ${h.log.includes(dayKey(0))})`).join('\n') || '(none)';
   const me = [['Name', profile.name], ['Situation', profile.situation], ['Goals', profile.goals], ['Weaknesses', profile.weaknesses], ['Strengths', profile.strengths], ['Routine and values', profile.routine]]
     .filter(([, v]) => v && v.trim()).map(([k, v]) => `${k}: ${v.trim()}`).join('\n') || '(not filled in yet: gently ask the user to complete their profile)';
@@ -90,6 +304,7 @@ Open tasks:
 ${open}
 Habits:
 ${hb}
+${ctx.extra || ''}
 USER PROFILE (permanent memory: always use it, never ask for it again):
 ${me}
 MEMORY FACTS:
@@ -113,7 +328,7 @@ async function loadFreePool() {
   return freePool;
 }
 
-async function callOnce(apiKey, model, messages) {
+async function callOnce(apiKey, model, messages, maxTokens = 1200) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 40000);
   try {
@@ -121,7 +336,7 @@ async function callOnce(apiKey, model, messages) {
       method: 'POST',
       signal: ctl.signal,
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://autokinetics.app', 'X-Title': 'AutoKinetics' },
-      body: JSON.stringify({ model, messages, max_tokens: 1200 }),
+      body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
     });
     let data = {};
     try { data = await res.json(); } catch (e) {}
@@ -136,14 +351,14 @@ async function callOnce(apiKey, model, messages) {
 }
 
 // Tries the free router first, then falls back across currently-free models.
-async function askAI(apiKey, history, system) {
+async function askAI(apiKey, history, system, maxTokens = 1200) {
   const turns = history.slice(-30).map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.text }));
   while (turns.length && turns[0].role !== 'user') turns.shift();
   const withSys = [{ role: 'system', content: system }, ...turns];
   const merged = turns.map((t, i) => (i === 0 ? { ...t, content: `${system}\n\n${t.content}` } : t));
   const attempt = async (model) => {
-    let r = await callOnce(apiKey, model, withSys);
-    if (r.status === 400) r = await callOnce(apiKey, model, merged); // some models reject system prompts
+    let r = await callOnce(apiKey, model, withSys, maxTokens);
+    if (r.status === 400) r = await callOnce(apiKey, model, merged, maxTokens); // some models reject system prompts
     if (r.status === 401) throw new Error('OpenRouter rejected your key. Re-copy it in settings (it starts with sk-or-).');
     if (r.status === 402) throw new Error('OpenRouter reports a negative balance. Free models need a balance of zero or more.');
     if (r.status === 429 && /per-day|daily/i.test(r.msg)) throw new Error('Daily free limit reached (about 50 free messages per day). It resets around 00:00 UTC.');
@@ -184,17 +399,6 @@ function Logo() {
   );
 }
 
-const Bubble = React.memo(({ item }) => {
-  const u = item.role === 'user';
-  return (
-    <View style={[s.row, { justifyContent: u ? 'flex-end' : 'flex-start' }]}>
-      <View style={[s.bubble, u ? s.bubbleU : s.bubbleA, item.error && { borderColor: C.offline }]}>
-        <Text style={[s.bubbleText, item.error && { color: '#F87171' }]}>{item.text}</Text>
-      </View>
-    </View>
-  );
-});
-const renderBubble = ({ item }) => <Bubble item={item} />;
 
 /* ---------- Small components ---------- */
 function CatChips({ value, onChange, withAll }) {
@@ -227,20 +431,447 @@ function AddRow({ placeholder, onAdd }) {
   );
 }
 
+/* ---------- Shared UI: toast with undo, confirm dialog, sub-screen shell ---------- */
+function Toast({ toast, onUndo, onClose }) {
+  const ins = useSafeAreaInsets();
+  if (!toast) return null;
+  return (
+    <View style={[s.toastWrap, { bottom: 64 + ins.bottom }]} pointerEvents="box-none">
+      <View style={s.toast}>
+        <Text style={[s.bubbleText, { fontSize: 14, flex: 1, lineHeight: 19 }]} numberOfLines={3}>{toast.text}</Text>
+        {!!toast.undo && <Pressable onPress={onUndo} hitSlop={8}><Text style={s.toastBtn}>Undo</Text></Pressable>}
+        <Pressable onPress={onClose} hitSlop={8}><Icon n="close" size={16} color={C.muted} style={{ marginLeft: 12 }} /></Pressable>
+      </View>
+    </View>
+  );
+}
+
+function Confirm({ c, onNo }) {
+  return (
+    <Modal visible={!!c} transparent animationType="fade" onRequestClose={onNo}>
+      <View style={s.backdrop}>
+        <View style={s.modal}>
+          <Text style={s.h1}>{c ? c.title : ''}</Text>
+          <Text style={[s.muted, { marginTop: 10 }]}>{c ? c.body : ''}</Text>
+          <View style={[s.between, { marginTop: 20, justifyContent: 'flex-end' }]}>
+            <Pressable style={s.ghost} onPress={onNo}><Text style={s.ghostText}>Cancel</Text></Pressable>
+            <Pressable style={[s.ghost, { backgroundColor: '#B91C1C', marginLeft: 8 }]} onPress={() => { const f = c && c.yes; onNo(); if (f) f(); }}>
+              <Text style={[s.ghostText, { color: '#fff' }]}>{c ? c.label : ''}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function Screen({ title, sub, onBack, children }) {
+  return (
+    <ScrollView contentContainerStyle={s.page} keyboardShouldPersistTaps="handled">
+      <Pressable onPress={onBack} hitSlop={10} style={[s.btnRow, { alignSelf: 'flex-start', marginBottom: 8 }]}>
+        <Icon n="chevron-back" size={18} color={C.muted} /><Text style={[s.muted, { marginLeft: 2 }]}>Today</Text>
+      </Pressable>
+      <Text style={s.h1}>{title}</Text>
+      {!!sub && <Text style={[s.muted, { marginTop: 4, marginBottom: 12 }]}>{sub}</Text>}
+      {children}
+    </ScrollView>
+  );
+}
+
+function Stepper({ label, value, onChange }) {
+  const go = (d) => onChange((((value + d) % 24) + 24) % 24);
+  return (
+    <View style={{ marginTop: 12 }}>
+      <Text style={s.muted}>{label}</Text>
+      <View style={[s.between, { marginTop: 6 }]}>
+        {[[-1, '\u22121h'], [-0.25, '\u221215m']].map(([d, l]) => <Pressable key={l} onPress={() => go(d)} style={s.stepBtn}><Text style={s.chipText}>{l}</Text></Pressable>)}
+        <Text style={s.stepVal}>{fmt(value)}</Text>
+        {[[0.25, '+15m'], [1, '+1h']].map(([d, l]) => <Pressable key={l} onPress={() => go(d)} style={s.stepBtn}><Text style={s.chipText}>{l}</Text></Pressable>)}
+      </View>
+    </View>
+  );
+}
+
+/* ---------- Sleep tracker ---------- */
+function Sleep({ meta, setMeta, activity, onBack }) {
+  const si = sleepInfo(meta), sl = meta.sleep || {}, lg = meta.sleepLog || {};
+  const prev = lastDays(14).map((d) => lg[d]).find(Boolean);
+  const [bed, setBed] = useState(prev ? prev.bed : 23);
+  const [wake, setWake] = useState(prev ? prev.wake : meta.wake || 7);
+  const [q, setQ] = useState(3);
+  const [off, setOff] = useState(0);
+  const [msg, setMsg] = useState('');
+  const hrs = (((wake - bed) % 24) + 24) % 24, okHrs = hrs >= 0.5 && hrs <= 16;
+  const asleep = meta.sleepStart, sd = asleep ? new Date(asleep) : null;
+  const save = (date, b, w, h, qual) => {
+    const rw = Math.round(w * 2) / 2;
+    setMeta((m) => ({
+      ...m, sleepStart: null,
+      sleep: { ...m.sleep, [date]: Math.round(h * 100) / 100 },
+      sleepLog: { ...m.sleepLog, [date]: { bed: b, wake: w, q: qual } },
+      ...(date === dayKey(0) && rw >= 3 && rw <= 12 ? { wake: rw } : {}),
+    }));
+  };
+  const stop = () => {
+    const e = (Date.now() - asleep) / 36e5, nw = new Date();
+    if (e < 0.5 || e > 16) {
+      setMeta((m) => ({ ...m, sleepStart: null }));
+      setMsg(e < 0.5 ? 'That was under 30 minutes, so it was discarded.' : 'The timer ran over 16 hours, so it was discarded. Log the night manually below.');
+      return;
+    }
+    save(dayKey(0), sd.getHours() + sd.getMinutes() / 60, nw.getHours() + nw.getMinutes() / 60, e, 3);
+    setMsg(`Logged ${hm(e)} of sleep. You can rate its quality in the list below.`);
+  };
+  const logManual = () => {
+    if (!okHrs) return;
+    save(dayKey(-off), bed, wake, hrs, q);
+    setMsg(`Saved ${hm(hrs)} for ${off ? 'yesterday' : 'last night'}.`);
+  };
+  const del = (d) => setMeta((m) => { const a = { ...m.sleep }, b = { ...m.sleepLog }; delete a[d]; delete b[d]; return { ...m, sleep: a, sleepLog: b }; });
+  const setQual = (d, v) => setMeta((m) => ({ ...m, sleepLog: { ...m.sleepLog, [d]: { ...(m.sleepLog || {})[d], q: v } } }));
+  const edge = sleepEdge(meta, activity);
+  const rows = lastDays(14).filter((d) => sl[d] != null);
+  const barColor = (h) => (h >= si.target ? C.online : h >= si.target - 1 ? '#FBBF24' : '#F87171');
+  return (
+    <Screen title="Sleep" sub="Track when you sleep. Readiness, your peak window and Coach all use this." onBack={onBack}>
+      <View style={s.card}>
+        {asleep ? (
+          <>
+            <Text style={s.muted}>Sleeping since {fmt(sd.getHours() + sd.getMinutes() / 60)}</Text>
+            <Text style={s.velocity}>{hm((Date.now() - asleep) / 36e5)}</Text>
+            <Pressable onPress={stop} style={[s.wide, { backgroundColor: C.accent, maxWidth: '100%', marginTop: 12 }]}><Text style={s.addBtnText}>I am awake</Text></Pressable>
+            <Pressable onPress={() => setMeta((m) => ({ ...m, sleepStart: null }))} style={[s.wide, { backgroundColor: '#17171A', maxWidth: '100%', marginTop: 8 }]}><Text style={s.ghostText}>Cancel timer</Text></Pressable>
+          </>
+        ) : (
+          <>
+            <Text style={[s.habitTitle, { flex: 0 }]}>Going to bed?</Text>
+            <Text style={[s.muted, { marginTop: 6 }]}>Start the timer now and open it again when you wake. Recommended bedtime tonight: {fmt(si.bedTonight)} for {si.target}h of sleep.</Text>
+            <Pressable onPress={() => { setMsg(''); setMeta((m) => ({ ...m, sleepStart: Date.now() })); }} style={[s.wide, { backgroundColor: C.accent, maxWidth: '100%', marginTop: 12 }]}><Text style={s.addBtnText}>Start sleep timer</Text></Pressable>
+          </>
+        )}
+        {!!msg && <Text style={[s.muted, { color: C.online, marginTop: 10 }]}>{msg}</Text>}
+      </View>
+
+      <View style={s.tiles}>
+        <Tile label="Last night" value={si.last == null ? '\u2013' : hm(si.last)} sub={si.last == null ? 'not logged' : `target ${si.target}h`} color={si.last == null ? undefined : barColor(si.last)} />
+        <Tile label="7-night avg" value={si.avg7 == null ? '\u2013' : hm(si.avg7)} sub={`${si.n7} night${si.n7 === 1 ? '' : 's'} logged`} />
+        <Tile label="Sleep debt" value={`${si.debt.toFixed(1)}h`} sub="last 7 nights" color={si.debt > 5 ? '#F87171' : si.debt > 2 ? '#FBBF24' : C.online} />
+        <Tile label="Avg bedtime" value={si.avgBed == null ? '\u2013' : fmt(si.avgBed)} sub="last 14 nights" />
+        <Tile label="Avg wake" value={fmt(si.avgWake)} sub={prev ? 'from your logs' : 'your set wake time'} />
+        <Tile label="Consistency" value={si.spread == null ? '\u2013' : `\u00B1${si.spread}m`} sub={si.spread == null ? 'needs 3 nights' : 'bedtime spread'} color={si.spread == null ? undefined : si.spread <= 30 ? C.online : si.spread <= 60 ? '#FBBF24' : '#F87171'} />
+      </View>
+
+      <View style={s.card}>
+        <Text style={[s.habitTitle, { flex: 0 }]}>Log a night manually</Text>
+        <View style={[s.chipRow, { marginTop: 10 }]}>
+          {[[0, 'Woke up today'], [1, 'Woke up yesterday']].map(([v, l]) => (
+            <Pressable key={v} onPress={() => setOff(v)} style={[s.chip, { paddingVertical: 6 }, off === v && { borderColor: C.accent, backgroundColor: C.raised }]}><Text style={s.chipText}>{l}</Text></Pressable>
+          ))}
+        </View>
+        <Stepper label="Bedtime" value={bed} onChange={setBed} />
+        <Stepper label="Wake time" value={wake} onChange={setWake} />
+        <Text style={[s.muted, { marginTop: 12 }]}>{okHrs ? `Total: ${hm(hrs)}` : 'Total looks off. Adjust the times (30 minutes to 16 hours).'}</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 10 }}>
+          <Text style={[s.muted, { width: 70 }]}>Quality</Text>
+          {[1, 2, 3, 4, 5].map((v) => <Pressable key={v} onPress={() => setQ(v)} style={[s.mini, q === v && { borderColor: C.accent, backgroundColor: C.raised }]}><Text style={s.chipText}>{v}</Text></Pressable>)}
+        </View>
+        <Pressable disabled={!okHrs} onPress={logManual} style={[s.wide, { backgroundColor: okHrs ? C.accent : C.disabled, maxWidth: '100%', marginTop: 14 }]}><Text style={s.addBtnText}>Save sleep</Text></Pressable>
+      </View>
+
+      <View style={s.card}>
+        <Text style={[s.habitTitle, { flex: 0 }]}>Last 14 nights</Text>
+        <View style={s.bars}>
+          {Array.from({ length: 14 }, (_, i) => 13 - i).map((i) => {
+            const d = dayKey(-i), h = sl[d], dt = new Date(d + 'T12:00:00');
+            return (
+              <View key={d} style={s.barCol}>
+                <Text style={[s.barLbl, { fontSize: 9 }]}>{h != null ? h.toFixed(1) : ''}</Text>
+                <View style={[s.bar, { width: 10, height: h != null ? 4 + Math.min(h, 10) * 7.6 : 4, backgroundColor: h != null ? barColor(h) : '#2A2A2E' }]} />
+                <Text style={s.barLbl}>{'SMTWTFS'[dt.getDay()]}</Text>
+              </View>
+            );
+          })}
+        </View>
+        <Text style={[s.muted, { fontSize: 12 }]}>Green meets your {si.target}h target, amber is within an hour, red is short.</Text>
+        <Text style={[s.muted, { marginTop: 10 }]}>
+          {edge === null ? 'Log nights under and over 7 hours to see how sleep changes your output.'
+            : `On nights with 7+ hours you complete ${Math.abs(edge).toFixed(1)} ${edge >= 0 ? 'more' : 'fewer'} wins per day than on shorter nights.`}
+        </Text>
+      </View>
+
+      <Text style={s.section}>History</Text>
+      {rows.length === 0 && <Text style={s.empty}>No nights logged yet. Start the timer tonight or log last night above.</Text>}
+      {rows.map((d) => (
+        <View key={d} style={s.item}>
+          <View style={{ flex: 1 }}>
+            <Text style={[s.itemText, { flex: 0 }]}>{dLabel(d)} · {hm(sl[d])}</Text>
+            <Text style={s.muted}>{lg[d] ? `${fmt(lg[d].bed)} to ${fmt(lg[d].wake)}` : 'Quick log (no times)'}</Text>
+            {!!lg[d] && (
+              <View style={{ flexDirection: 'row', marginTop: 4 }}>
+                {[1, 2, 3, 4, 5].map((v) => <Pressable key={v} onPress={() => setQual(d, v)} hitSlop={4}><Icon n={v <= (lg[d].q || 0) ? 'star' : 'star-outline'} size={16} color="#FBBF24" style={{ marginRight: 3 }} /></Pressable>)}
+              </View>
+            )}
+          </View>
+          <Pressable onPress={() => del(d)} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable>
+        </View>
+      ))}
+    </Screen>
+  );
+}
+
+/* ---------- Goals ---------- */
+function Goals({ meta, setMeta, onXp, onBack }) {
+  const goals = meta.goals || [];
+  const [title, setTitle] = useState(''), [target, setTarget] = useState('10'), [cat, setCat] = useState('discipline');
+  const add = () => {
+    if (!title.trim()) return;
+    const n = Math.max(1, Math.min(10000, parseInt(target, 10) || 1));
+    setMeta((m) => ({ ...m, goals: [{ id: uid(), title: title.trim(), cat, target: n, current: 0, done: false }, ...(m.goals || [])] }));
+    setTitle('');
+  };
+  const step = (g, d) => {
+    const cur = Math.max(0, Math.min(g.target, g.current + d));
+    if (cur === g.current) return;
+    const done = cur >= g.target;
+    setMeta((m) => ({ ...m, goals: (m.goals || []).map((x) => (x.id === g.id ? { ...x, current: cur, done } : x)) }));
+    if (done && !g.done) onXp(25);
+    if (!done && g.done) onXp(-25);
+  };
+  return (
+    <Screen title="Goals" sub="Big targets with a number. Finishing one earns 25 XP and Coach knows about every open goal." onBack={onBack}>
+      <TextInput style={[s.addInput, { marginBottom: 8 }]} value={title} onChangeText={setTitle} placeholder="Goal (e.g. Read 12 books)" placeholderTextColor={C.muted} keyboardAppearance="dark" />
+      <View style={s.addRow}>
+        <TextInput style={s.addInput} value={target} onChangeText={setTarget} keyboardType="number-pad" placeholder="Target number" placeholderTextColor={C.muted} keyboardAppearance="dark" onSubmitEditing={add} />
+        <Pressable onPress={add} style={[s.addBtn, !title.trim() && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Add</Text></Pressable>
+      </View>
+      <CatChips value={cat} onChange={setCat} />
+      {goals.length === 0 && <Text style={s.empty}>No goals yet. Pick something measurable.</Text>}
+      {goals.map((g) => {
+        const c = catOf(g.cat), inc = g.target <= 20 ? 1 : Math.round(g.target / 10);
+        return (
+          <View key={g.id} style={s.card}>
+            <View style={s.between}>
+              <View style={[s.btnRow, { flex: 1, justifyContent: 'flex-start' }]}><Icon n={g.done ? 'trophy' : c.icon} size={20} color={g.done ? '#FBBF24' : c.color} /><Text style={[s.habitTitle, { marginLeft: 8 }]}>{g.title}</Text></View>
+              <Pressable onPress={() => setMeta((m) => ({ ...m, goals: (m.goals || []).filter((x) => x.id !== g.id) }))} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable>
+            </View>
+            <View style={s.track}><View style={[s.fill, { width: `${(g.current / g.target) * 100}%`, backgroundColor: g.done ? '#FBBF24' : c.color }]} /></View>
+            <View style={s.between}>
+              <Text style={s.muted}>{g.current} / {g.target}{g.done ? ' · done' : ''}</Text>
+              <View style={s.btnRow}>
+                <Pressable onPress={() => step(g, -inc)} style={s.stepBtn} hitSlop={6}><Text style={s.chipText}>{'\u2212'}{inc}</Text></Pressable>
+                <Pressable onPress={() => step(g, inc)} style={[s.stepBtn, { marginLeft: 8, backgroundColor: C.accent }]} hitSlop={6}><Text style={[s.chipText, { color: C.onAccent, fontWeight: '700' }]}>+{inc}</Text></Pressable>
+              </View>
+            </View>
+          </View>
+        );
+      })}
+    </Screen>
+  );
+}
+
+/* ---------- Journal ---------- */
+function Journal({ meta, setMeta, onSave, onBack }) {
+  const list = meta.journal || [];
+  const [text, setText] = useState('');
+  const prompt = JOURNAL_PROMPTS[new Date().getDate() % JOURNAL_PROMPTS.length];
+  const days = new Set(list.map((j) => j.date));
+  let streak = 0, off = days.has(dayKey(0)) ? 0 : -1;
+  while (days.has(dayKey(off))) { streak++; off--; }
+  const save = () => { if (!text.trim()) return; onSave(text.trim(), prompt); setText(''); };
+  return (
+    <Screen title="Journal" sub={`${list.length} entr${list.length === 1 ? 'y' : 'ies'} · ${streak} day streak. The first entry each day earns 5 XP.`} onBack={onBack}>
+      <View style={s.card}>
+        <Text style={s.muted}>Today's prompt</Text>
+        <Text style={[s.bigQ, { fontSize: 19, lineHeight: 25, marginTop: 6 }]}>{prompt}</Text>
+      </View>
+      <TextInput style={[s.addInput, { minHeight: 130, textAlignVertical: 'top' }]} value={text} onChangeText={setText} multiline placeholder="Write freely. This stays on your device." placeholderTextColor={C.muted} keyboardAppearance="dark" />
+      <Pressable onPress={save} style={[s.wide, { backgroundColor: text.trim() ? C.accent : C.disabled, maxWidth: '100%', marginTop: 10 }]}><Text style={s.addBtnText}>Save entry</Text></Pressable>
+      <Text style={s.section}>Past entries</Text>
+      {list.length === 0 && <Text style={s.empty}>Nothing written yet.</Text>}
+      {list.slice(0, 30).map((j) => (
+        <View key={j.id} style={s.card}>
+          <View style={s.between}>
+            <Text style={s.muted}>{dLabel(j.date)} · {timeOf(j.ts)}</Text>
+            <Pressable onPress={() => setMeta((m) => ({ ...m, journal: (m.journal || []).filter((x) => x.id !== j.id) }))} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable>
+          </View>
+          {!!j.prompt && <Text style={[s.muted, { fontSize: 12, marginTop: 6 }]}>{j.prompt}</Text>}
+          <Text style={[s.bubbleText, { marginTop: 6 }]}>{j.text}</Text>
+        </View>
+      ))}
+    </Screen>
+  );
+}
+
+/* ---------- Badges ---------- */
+function Badges({ list, onBack }) {
+  const n = list.filter((b) => b.ok).length;
+  return (
+    <Screen title="Badges" sub={`${n} of ${list.length} unlocked. They unlock from your real activity.`} onBack={onBack}>
+      {list.map((b) => (
+        <View key={b.id} style={[s.item, !b.ok && { opacity: 0.75 }]}>
+          <View style={[s.bigIconWrap, { width: 46, height: 46, borderRadius: 23, marginBottom: 0, marginRight: 12 }, b.ok && { borderColor: '#FBBF24' }]}>
+            <Icon n={b.icon} size={22} color={b.ok ? '#FBBF24' : C.muted} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={[s.habitTitle, { flex: 0 }]}>{b.name}</Text>
+            <Text style={s.muted}>{b.desc}</Text>
+            <View style={[s.track, { marginVertical: 6 }]}><View style={[s.fill, { width: `${Math.min(100, (b.cur / b.need) * 100)}%`, backgroundColor: b.ok ? '#FBBF24' : C.muted }]} /></View>
+            <Text style={[s.muted, { fontSize: 12 }]}>{b.ok ? 'Unlocked' : `${b.cur} / ${b.need}`}</Text>
+          </View>
+        </View>
+      ))}
+    </Screen>
+  );
+}
+
+/* ---------- Weekly review ---------- */
+function Review({ habits, activity, meta, online, onBack, onAnalyze }) {
+  const r = useMemo(() => {
+    const d7 = lastDays(7), p7 = lastDays(14).slice(7), fd = meta.focusDays || {}, si = sleepInfo(meta);
+    const wins = sum(d7.map((d) => activity[d] || 0)), prevWins = sum(p7.map((d) => activity[d] || 0));
+    const f7 = sum(d7.map((d) => fd[d] || 0)), fp = sum(p7.map((d) => fd[d] || 0));
+    const hrate = habits.length ? Math.round((100 * sum(d7.map((d) => habits.filter((h) => h.log.includes(d)).length))) / (7 * habits.length)) : null;
+    const best = d7.slice().sort((a, b) => (activity[b] || 0) - (activity[a] || 0))[0];
+    const cnt = (h) => h.log.filter((d) => d7.includes(d)).length;
+    const top = habits.slice().sort((a, b) => cnt(b) - cnt(a))[0];
+    const plans = d7.map((d) => (meta.plans || {})[d]).filter(Boolean);
+    const pb = sum(plans.map((p) => p.blocks.length)), pd = sum(plans.map((p) => p.blocks.filter((b) => b.done).length));
+    const water = d7.filter((d) => ((meta.water || {})[d] || 0) >= (meta.waterGoal || 8)).length;
+    const jr = (meta.journal || []).filter((j) => d7.includes(j.date)).length;
+    const lines = [
+      ['Wins', `${wins} (${wins - prevWins >= 0 ? '+' : ''}${wins - prevWins} vs last week)`],
+      ['Deep focus', `${f7} min${fp ? ` (${f7 >= fp ? '+' : ''}${Math.round(((f7 - fp) / fp) * 100)}% vs last week)` : ''}`],
+      ['Habit completion', hrate === null ? 'no habits yet' : `${hrate}%`],
+      ['Sleep', si.avg7 === null ? 'not logged' : `${hm(si.avg7)} avg, ${si.debt.toFixed(1)}h debt${si.spread === null ? '' : `, bedtime \u00B1${si.spread} min`}`],
+      ['Plan follow-through', pb ? `${Math.round((100 * pd) / pb)}% of ${pb} blocks` : 'no plans yet'],
+      ['Water goal', `${water} of 7 days`],
+      ['Journal entries', String(jr)],
+      ['Best day', wins > 0 ? `${dLabel(best)} (${activity[best] || 0} wins)` : 'n/a'],
+      ['Top habit', top && cnt(top) > 0 ? `${top.title} (${cnt(top)}/7)` : 'n/a'],
+    ];
+    return { lines };
+  }, [habits, activity, meta]);
+  const text = `AutoKinetics weekly review\n${r.lines.map(([k, v]) => `${k}: ${v}`).join('\n')}`;
+  const [msg, setMsg] = useState('');
+  const share = async () => { try { await Share.share({ message: text }); } catch (e) { setMsg('Sharing is not available here.'); } };
+  return (
+    <Screen title="Weekly review" sub="Your last 7 days against the 7 before. Works offline." onBack={onBack}>
+      <View style={s.card}>
+        {r.lines.map(([k, v]) => (
+          <View key={k} style={[s.between, { paddingVertical: 7, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: C.border }]}>
+            <Text style={s.muted}>{k}</Text>
+            <Text style={[s.bubbleText, { fontSize: 14, flexShrink: 1, textAlign: 'right', marginLeft: 12 }]}>{v}</Text>
+          </View>
+        ))}
+      </View>
+      <Pressable disabled={!online} onPress={() => onAnalyze(`Run my weekly review. Here are my numbers for the last 7 days:\n${r.lines.map(([k, v]) => `${k}: ${v}`).join('\n')}\nName what worked, my 3 biggest bottlenecks, and one concrete experiment for each next week.`)} style={[s.wide, { backgroundColor: C.accent, maxWidth: '100%', opacity: online ? 1 : 0.4 }]}>
+        <View style={s.btnRow}><Icon n="sparkles-outline" size={18} color={C.onAccent} /><Text style={[s.addBtnText, { marginLeft: 8 }]}>{online ? 'AI weekly review' : 'AI review needs a connection'}</Text></View>
+      </Pressable>
+      <Pressable onPress={share} style={[s.wide, { backgroundColor: '#17171A', maxWidth: '100%', marginTop: 8 }]}>
+        <View style={s.btnRow}><Icon n="share-outline" size={18} /><Text style={[s.ghostText, { marginLeft: 8 }]}>Share this report</Text></View>
+      </Pressable>
+      {!!msg && <Text style={[s.empty, { color: '#F87171' }]}>{msg}</Text>}
+    </Screen>
+  );
+}
+
 /* ---------- Today ---------- */
-function Today({ tasks, habits, xp, online, activity, focusMin, meta, setMeta, pk, inPeak, onUrge, onToggle, onAdd, onDelete, onPlan }) {
+function PlanCard({ plan, online, busy, onToggle, onClear, onReplan }) {
+  const d = new Date(), now = d.getHours() + d.getMinutes() / 60;
+  const done = plan.blocks.filter((b) => b.done).length;
+  return (
+    <View style={s.card}>
+      <View style={s.between}>
+        <View style={s.btnRow}><Icon n="calendar-outline" size={16} color={C.muted} /><Text style={[s.muted, { marginLeft: 6 }]}>Today's plan · {done}/{plan.blocks.length} done</Text></View>
+        <Pressable onPress={onClear} hitSlop={10}><Text style={s.muted}>Clear</Text></Pressable>
+      </View>
+      {!!plan.focus && <Text style={[s.habitTitle, { flex: 0, marginTop: 10 }]}>The one thing: {plan.focus}</Text>}
+      <View style={s.track}><View style={[s.fill, { width: `${(done / plan.blocks.length) * 100}%`, backgroundColor: C.online }]} /></View>
+      {plan.blocks.map((b) => {
+        const c = catOf(b.cat), cur = !b.done && b.start <= now && now < b.end;
+        return (
+          <Pressable key={b.id} onPress={() => onToggle(b.id)} style={[s.planRow, cur && { borderColor: C.accent }]}>
+            <View style={[s.check, { borderColor: c.color }, b.done && { backgroundColor: c.color }]}>{b.done && <Icon n="checkmark" size={16} color="#000" />}</View>
+            <View style={{ flex: 1 }}>
+              <Text style={[s.itemText, { flex: 0 }, b.done && s.done]}>{b.title}</Text>
+              <Text style={s.muted}>{fmt(b.start)} – {fmt(b.end)}{cur ? ' · now' : ''}{b.taskId || b.habitId ? ' · linked' : ''}</Text>
+            </View>
+            <Icon n={c.icon} size={18} color={c.color} />
+          </Pressable>
+        );
+      })}
+      <Pressable disabled={!online || busy} onPress={onReplan} style={[s.logBtn, { alignSelf: 'flex-start', marginTop: 8 }, (!online || busy) && { opacity: 0.4 }]}>
+        <Text style={s.logText}>{busy ? 'Coach is planning…' : 'Replan with Coach'}</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+const TOOLS = [['sleep', 'moon-outline', 'Sleep'], ['journal', 'book-outline', 'Journal'], ['goals', 'trophy-outline', 'Goals'], ['badges', 'ribbon-outline', 'Badges'], ['review', 'document-text-outline', 'Review']];
+
+function Today({
+  name, tasks, habits, xp, online, busy, activity, focusMin, meta, setMeta, pk, inPeak, plan, tomorrowPlan, score, nudgeList,
+  onOpen, onUrge, onToggle, onAdd, onDelete, onPlan, onStar, onRepeat, onClearDone, onToggleBlock, onClearPlan, onWater,
+}) {
   const [cat, setCat] = useState('all');
+  const [rep, setRep] = useState('');
   const lvl = Math.floor(xp / 100) + 1, into = xp % 100;
   const rank = RANKS[Math.min(lvl - 1, RANKS.length - 1)];
-  const today = dayKey(0);
-  const shown = tasks.filter((t) => cat === 'all' || t.cat === cat).sort((a, b) => a.done - b.done);
+  const today = dayKey(0), hr = new Date().getHours();
+  const shown = tasks.filter((t) => cat === 'all' || t.cat === cat).sort((a, b) => a.done - b.done || (b.star ? 1 : 0) - (a.star ? 1 : 0));
+  const doneN = tasks.filter((t) => t.done).length;
   const pillars = CATS.map((c) => {
     const ts = tasks.filter((t) => t.cat === c.id), hs = habits.filter((h) => h.cat === c.id);
     return { c, total: ts.length + hs.length, done: ts.filter((t) => t.done).length + hs.filter((h) => h.log.includes(today)).length };
   });
+  const water = (meta.water || {})[today] || 0, wg = meta.waterGoal || 8;
+  const hello = hr < 5 ? 'Still up' : hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
+  const go = (g) => (g === 'plan' ? onPlan() : g ? onOpen(g) : null);
+  const scoreColor = score.score >= 70 ? C.online : score.score >= 40 ? '#FBBF24' : '#F87171';
   return (
     <ScrollView contentContainerStyle={s.page} keyboardShouldPersistTaps="handled">
-      <PeakCard meta={meta} setMeta={setMeta} pk={pk} inPeak={inPeak} />
+      <View style={s.card}>
+        <Text style={s.h1}>{hello}{name ? `, ${name}` : ''}</Text>
+        <View style={[s.between, { marginTop: 8 }]}>
+          <Text style={s.muted}>Day score</Text>
+          <Text style={[s.h1, { fontSize: 34, color: scoreColor }]}>{score.score}</Text>
+        </View>
+        <View style={s.track}><View style={[s.fill, { width: `${score.score}%`, backgroundColor: scoreColor }]} /></View>
+        <Text style={[s.muted, { fontSize: 12 }]}>{score.txt}</Text>
+      </View>
+
+      {nudgeList.map((n, i) => (
+        <Pressable key={i} onPress={() => go(n.go)} style={[s.item, { marginBottom: 8 }]}>
+          <Icon n={n.icon} size={18} color={C.accent} style={{ marginRight: 10 }} />
+          <Text style={[s.itemText, { fontSize: 14 }]}>{n.text}</Text>
+          {!!n.go && <Icon n="chevron-forward" size={16} color={C.muted} />}
+        </Pressable>
+      ))}
+
+      {plan ? <PlanCard plan={plan} online={online} busy={busy} onToggle={onToggleBlock} onClear={onClearPlan} onReplan={onPlan} /> : null}
+      {!plan && tomorrowPlan ? <Text style={[s.muted, { marginBottom: 12 }]}>Tomorrow's plan is ready ({tomorrowPlan.blocks.length} blocks). It shows up here once the day starts.</Text> : null}
+
+      <View style={s.toolRow}>
+        {TOOLS.map(([id, ic, label]) => (
+          <Pressable key={id} onPress={() => onOpen(id)} style={s.tool}><Icon n={ic} size={22} /><Text style={[s.tabLabel, { color: C.text }]}>{label}</Text></Pressable>
+        ))}
+      </View>
+
+      <PeakCard meta={meta} setMeta={setMeta} pk={pk} inPeak={inPeak} onSleep={() => onOpen('sleep')} />
+
+      <View style={s.card}>
+        <View style={s.between}>
+          <View style={s.btnRow}><Icon n="water-outline" size={18} color="#60A5FA" /><Text style={[s.habitTitle, { flex: 0, marginLeft: 8 }]}>Water {water}/{wg}</Text></View>
+          <View style={s.btnRow}>
+            <Pressable onPress={() => onWater(-1)} style={s.stepBtn} hitSlop={6}><Icon n="remove" size={18} /></Pressable>
+            <Pressable onPress={() => onWater(1)} style={[s.stepBtn, { marginLeft: 8, backgroundColor: C.accent }]} hitSlop={6}><Icon n="add" size={18} color={C.onAccent} /></Pressable>
+          </View>
+        </View>
+        <View style={[s.chipRow, { marginTop: 10 }]}>
+          {Array.from({ length: Math.max(wg, water) }, (_, i) => <View key={i} style={[s.glass, i < water && { backgroundColor: '#60A5FA', borderColor: '#60A5FA' }]} />)}
+        </View>
+      </View>
+
       <View style={s.card}>
         <View style={s.between}>
           <Text style={s.h1}>Level {lvl}</Text>
@@ -280,13 +911,21 @@ function Today({ tasks, habits, xp, online, activity, focusMin, meta, setMeta, p
       <Pressable onPress={onUrge} style={[s.planBtn, { borderColor: '#5B1F1F' }]}>
         <View style={s.btnRow}><Icon n="hand-left-outline" size={18} color="#F87171" /><Text style={[s.planText, { marginLeft: 8 }]}>Urge to scroll? Pause first ({meta.urges} resisted)</Text></View>
       </Pressable>
-      <Pressable disabled={!online} onPress={onPlan} style={[s.planBtn, !online && { opacity: 0.4 }]}>
-        <View style={s.btnRow}><Icon n="sparkles-outline" size={18} /><Text style={[s.planText, { marginLeft: 8 }]}>{online ? 'Ask Coach to plan my day' : 'Coach planning needs a connection'}</Text></View>
+      <Pressable disabled={!online || busy} onPress={onPlan} style={[s.planBtn, (!online || busy) && { opacity: 0.4 }]}>
+        <View style={s.btnRow}><Icon n="sparkles-outline" size={18} /><Text style={[s.planText, { marginLeft: 8 }]}>{busy ? 'Coach is planning your day…' : online ? 'Ask Coach to plan my day' : 'Coach planning needs a connection'}</Text></View>
       </Pressable>
 
-      <Text style={s.section}>Tasks</Text>
+      <View style={[s.between, { marginTop: 24, marginBottom: 12 }]}>
+        <Text style={[s.section, { marginTop: 0, marginBottom: 0 }]}>Tasks</Text>
+        {doneN > 0 && <Pressable onPress={onClearDone} hitSlop={10}><Text style={s.muted}>Clear {doneN} done</Text></Pressable>}
+      </View>
       <CatChips value={cat} onChange={setCat} withAll />
-      <AddRow placeholder={`Add a ${cat === 'all' ? 'Discipline' : catOf(cat).name} task`} onAdd={(t) => onAdd(t, cat === 'all' ? 'discipline' : cat)} />
+      <AddRow placeholder={`Add a ${cat === 'all' ? 'Discipline' : catOf(cat).name} task`} onAdd={(t) => onAdd(t, cat === 'all' ? 'discipline' : cat, rep)} />
+      <View style={[s.chipRow, { marginTop: -4 }]}>
+        {[['', 'No repeat'], ['daily', 'Repeat daily'], ['weekly', 'Repeat weekly']].map(([v, l]) => (
+          <Pressable key={v || 'none'} onPress={() => setRep(v)} style={[s.chip, { paddingVertical: 5 }, rep === v && { borderColor: C.accent, backgroundColor: C.raised }]}><Text style={[s.chipText, { fontSize: 13 }]}>{l}</Text></Pressable>
+        ))}
+      </View>
       {shown.length === 0 && <Text style={s.empty}>Nothing here yet. Add one small task you can finish today.</Text>}
       {shown.map((t) => {
         const c = catOf(t.cat);
@@ -296,6 +935,12 @@ function Today({ tasks, habits, xp, online, activity, focusMin, meta, setMeta, p
               {t.done && <Icon n="checkmark" size={16} color="#000" />}
             </Pressable>
             <Text style={[s.itemText, t.done && s.done]}>{t.title}</Text>
+            {!!t.repeat && (
+              <Pressable onPress={() => onRepeat(t.id)} hitSlop={8} style={s.btnRow}>
+                <Icon n="repeat" size={15} color="#60A5FA" style={{ marginLeft: 6 }} /><Text style={{ color: '#60A5FA', fontSize: 11, marginLeft: 3 }}>{t.repeat}</Text>
+              </Pressable>
+            )}
+            <Pressable onPress={() => onStar(t.id)} hitSlop={8}><Icon n={t.star ? 'star' : 'star-outline'} size={18} color={t.star ? '#FBBF24' : C.muted} style={{ marginLeft: 8 }} /></Pressable>
             <Icon n={c.icon} size={18} color={c.color} style={{ marginHorizontal: 10 }} />
             <Pressable onPress={() => onDelete(t.id)} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable>
           </View>
@@ -325,6 +970,7 @@ function Habits({ habits, onToggle, onAdd, onDelete }) {
               <View style={[s.btnRow, { flex: 1, justifyContent: 'flex-start' }]}><Icon n={c.icon} size={20} color={c.color} /><Text style={[s.habitTitle, { marginLeft: 8 }]}>{h.title}</Text></View>
               <Pressable onPress={() => onDelete(h.id)} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable>
             </View>
+            <Text style={[s.muted, { marginTop: 8, fontSize: 12 }]}>Best streak {longest(h.log)}d · 30-day rate {Math.round((100 * h.log.filter((d) => lastDays(30).includes(d)).length) / 30)}% · {h.log.length} total check-ins</Text>
             <View style={[s.between, { marginTop: 12 }]}>
               <View style={{ flexDirection: 'row' }}>
                 {[6, 5, 4, 3, 2, 1, 0].map((i) => (
@@ -398,29 +1044,32 @@ function MicroQuiz({ card, onRate, onClose }) {
   );
 }
 
-function PeakCard({ meta, setMeta, pk, inPeak }) {
+function PeakCard({ meta, setMeta, pk, inPeak, onSleep }) {
   const d = new Date(), now = d.getHours() + d.getMinutes() / 60;
   const mins = Math.round((pk.start - now) * 60);
   const status = inPeak ? 'You are in your peak. Heavy tasks only, no scrolling.'
     : mins > 0 ? `Starts in ${Math.floor(mins / 60)}h ${mins % 60}m. Line up your hardest task.`
     : 'Window closed. Use the rest of the day for light tasks and admin.';
-  const sleep = (meta.sleep || {})[dayKey(0)] ?? 7;
-  const Row = ({ label, val, onPick }) => (
-    <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8 }}>
-      <Text style={[s.muted, { width: 110 }]}>{label}</Text>
-      {[5, 6, 7, 8, 9].map((v) => (
-        <Pressable key={v} onPress={() => onPick(v)} style={[s.mini, val === v && { borderColor: C.accent, backgroundColor: C.raised }]}><Text style={s.chipText}>{v}</Text></Pressable>
-      ))}
-    </View>
-  );
+  const sl = (meta.sleep || {})[dayKey(0)];
   return (
     <View style={[s.card, inPeak && { borderColor: C.accent }]}>
       <View style={[s.btnRow, { justifyContent: 'flex-start' }]}><Icon n="flash-outline" size={16} color={C.muted} /><Text style={[s.muted, { marginLeft: 6 }]}>Peak cognitive window</Text></View>
       <Text style={s.h1}>{fmt(pk.start)} – {fmt(pk.end)}</Text>
       <Text style={[s.muted, { marginTop: 4 }]}>{status}</Text>
-      <Row label="Sleep last night (h)" val={Math.round(sleep)} onPick={(v) => setMeta((m) => ({ ...m, sleep: { ...m.sleep, [dayKey(0)]: v } }))} />
-      <Row label="Wake time (am)" val={meta.wake} onPick={(v) => setMeta((m) => ({ ...m, wake: v }))} />
-      <Text style={[s.muted, { marginTop: 8, fontSize: 12 }]}>{pk.learned ? 'Learned from when you actually finish focus sessions.' : 'Estimated from wake time and sleep. Learns your real peak after 3 focus sessions.'}</Text>
+      <Pressable onPress={onSleep} style={[s.between, { marginTop: 12 }]}>
+        <View style={[s.btnRow, { flex: 1, justifyContent: 'flex-start' }]}>
+          <Icon n="moon-outline" size={16} color={C.muted} />
+          <Text style={[s.muted, { marginLeft: 6, flex: 1 }]}>{meta.sleepStart ? 'Sleep timer running. Tap when you wake.' : sl == null ? 'Sleep not logged yet. Tap to log it.' : `Slept ${hm(sl)} last night`}</Text>
+        </View>
+        <Icon n="chevron-forward" size={16} color={C.muted} />
+      </Pressable>
+      <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8 }}>
+        <Text style={[s.muted, { width: 110 }]}>Wake time (am)</Text>
+        {[5, 6, 7, 8, 9].map((v) => (
+          <Pressable key={v} onPress={() => setMeta((m) => ({ ...m, wake: v }))} style={[s.mini, Math.round(meta.wake) === v && { borderColor: C.accent, backgroundColor: C.raised }]}><Text style={s.chipText}>{v}</Text></Pressable>
+        ))}
+      </View>
+      <Text style={[s.muted, { marginTop: 8, fontSize: 12 }]}>{pk.learned ? 'Learned from when you actually finish focus sessions.' : 'Estimated from your wake time and sleep. Learns your real peak after 3 focus sessions.'}</Text>
       <Pressable onPress={() => setMeta((m) => ({ ...m, lock: !m.lock }))} style={[s.logBtn, { alignSelf: 'flex-start', marginTop: 10 }, meta.lock && { borderColor: C.accent }]}>
         <View style={s.btnRow}><Icon n={meta.lock ? 'lock-closed' : 'lock-open-outline'} size={14} /><Text style={[s.logText, { marginLeft: 6 }]}>Peak Lock: {meta.lock ? 'ON' : 'OFF'}</Text></View>
       </Pressable>
@@ -621,7 +1270,7 @@ function SpanTest({ best, onResult }) {
   );
 }
 
-function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onAnalyze }) {
+function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onOpen, onAnalyze }) {
   const today = dayKey(0);
   const m = useMemo(() => {
     const d7 = lastDays(7), d14 = lastDays(14), fd = meta.focusDays || {}, sl = meta.sleep || {};
@@ -635,7 +1284,7 @@ function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onAnalyz
     const balance = tot ? Math.round(100 * (1 - sum(eff.map((e) => Math.abs(e.v / tot - 1 / k))) / (2 * (1 - 1 / k)))) : 0;
     const weakest = tot ? eff.slice().sort((a, b) => a.v - b.v)[0].c : null;
     const vel = velocity(habits), mood = (meta.mood || {})[today];
-    const readiness = Math.round(100 * (0.4 * clamp((sl[today] ?? 7) / 8) + 0.3 * (vel / 100) + 0.3 * (mood ? (mood.e - 1) / 4 : 0.6)));
+    const readiness = Math.round(100 * (0.4 * clamp((sleepNow(meta) ?? 6) / (meta.sleepTarget || 8)) + 0.3 * (vel / 100) + 0.3 * (mood ? (mood.e - 1) / 4 : 0.6)));
     const rt = meta.rt || [], rtAvg = rt.length ? Math.round(sum(rt.slice(-5)) / Math.min(5, rt.length)) : null;
     const rv = meta.reviews || { ok: 0, n: 0 }, ret = rv.n ? Math.round((100 * rv.ok) / rv.n) : null;
     const parts = [readiness, rtAvg ? 100 * clamp((500 - rtAvg) / 300) : null, meta.span ? 100 * clamp(meta.span / 9) : null, ret].filter((x) => x !== null);
@@ -646,6 +1295,9 @@ function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onAnalyz
       ic: meta.urges + meta.slips ? Math.round((100 * meta.urges) / (meta.urges + meta.slips)) : null,
       mastered: cards.filter((c) => c.box >= 4).length,
       best: Math.max(0, ...habits.map((h) => longest(h.log))),
+      planRate: (() => { const ps = lastDays(7).map((d) => (meta.plans || {})[d]).filter(Boolean), pb = sum(ps.map((p) => p.blocks.length)); return pb ? Math.round((100 * sum(ps.map((p) => p.blocks.filter((b) => b.done).length))) / pb) : null; })(),
+      debt: sleepInfo(meta).debt,
+      waterDays: lastDays(7).filter((d) => ((meta.water || {})[d] || 0) >= (meta.waterGoal || 8)).length,
     };
   }, [tasks, habits, activity, cards, meta]);
 
@@ -653,7 +1305,7 @@ function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onAnalyz
   const setMood = (key, v) => setMeta((mt) => ({ ...mt, mood: { ...mt.mood, [today]: { m: 3, e: 3, ...(mt.mood || {})[today], [key]: v } } }));
   const hrs = meta.hours || {}, mx = Math.max(1, ...Object.values(hrs));
   const delta = m.fPrev ? Math.round(((m.f7 - m.fPrev) / m.fPrev) * 100) : null;
-  const summary = `Give me a performance review from my analytics. Cognitive index ${m.cpi}, readiness ${m.readiness}, focus last 7 days ${m.f7} min (previous week ${m.fPrev}), habit rate 7d ${m.h7}% and 30d ${m.h30}%, pillar balance ${m.balance}/100${m.weakest ? ` (weakest: ${m.weakest.name})` : ''}, recall retention ${m.ret ?? 'n/a'}%, impulse control ${m.ic ?? 'n/a'}%, average sleep ${m.avgSleep.toFixed(1)}h, reaction ${m.rtAvg ?? 'n/a'} ms, memory span ${meta.span || 'n/a'}. Name my 3 biggest bottlenecks and give one concrete experiment for each this week.`;
+  const summary = `Give me a performance review from my analytics. Cognitive index ${m.cpi}, readiness ${m.readiness}, focus last 7 days ${m.f7} min (previous week ${m.fPrev}), habit rate 7d ${m.h7}% and 30d ${m.h30}%, pillar balance ${m.balance}/100${m.weakest ? ` (weakest: ${m.weakest.name})` : ''}, recall retention ${m.ret ?? 'n/a'}%, impulse control ${m.ic ?? 'n/a'}%, average sleep ${m.avgSleep.toFixed(1)}h, sleep debt ${m.debt.toFixed(1)}h, plan follow-through ${m.planRate ?? 'n/a'}%, reaction ${m.rtAvg ?? 'n/a'} ms, memory span ${meta.span || 'n/a'}. Name my 3 biggest bottlenecks and give one concrete experiment for each this week.`;
 
   return (
     <ScrollView contentContainerStyle={s.page} keyboardShouldPersistTaps="handled">
@@ -697,15 +1349,18 @@ function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onAnalyz
         <Tile label="Recall retention" value={m.ret === null ? '–' : `${m.ret}%`} sub={`${m.mastered} cards mastered`} />
         <Tile label="Impulse control" value={m.ic === null ? '–' : `${m.ic}%`} sub={`${meta.urges} resisted, ${meta.slips} slips`} />
         <Tile label="Average sleep" value={m.avgSleep ? `${m.avgSleep.toFixed(1)}h` : '–'} sub="logged nights" />
+        <Tile label="Sleep debt" value={`${m.debt.toFixed(1)}h`} sub="last 7 nights" color={m.debt > 5 ? '#F87171' : m.debt > 2 ? '#FBBF24' : C.online} />
+        <Tile label="Plan done" value={m.planRate === null ? '\u2013' : `${m.planRate}%`} sub="plan blocks, 7 days" />
+        <Tile label="Water goal" value={`${m.waterDays}/7`} sub="days hit" />
         <Tile label="Reaction (last 5)" value={m.rtAvg ? `${m.rtAvg}ms` : '–'} sub="lower is faster" />
         <Tile label="Memory span" value={meta.span || '–'} sub="digits" />
         <Tile label="Pillar balance" value={m.balance} sub={m.weakest ? `weakest: ${m.weakest.name}` : 'no data yet'} />
       </View>
 
       <View style={s.card}>
-        <Text style={s.habitTitle}>Sleep and performance</Text>
+        <Pressable onPress={() => onOpen('sleep')} style={s.between}><Text style={s.habitTitle}>Sleep and performance</Text><View style={s.btnRow}><Text style={s.muted}>Sleep tracker</Text><Icon n="chevron-forward" size={16} color={C.muted} /></View></Pressable>
         <Text style={[s.muted, { marginTop: 6 }]}>
-          {m.edge === null ? 'Log sleep on days you sleep under and over 7 hours (Today tab) to see how sleep changes your output.'
+          {m.edge === null ? 'Log sleep on days you sleep under and over 7 hours (Sleep tracker) to see how sleep changes your output.'
             : `On nights with 7+ hours you complete ${m.edge >= 0 ? m.edge.toFixed(1) : Math.abs(m.edge).toFixed(1)} ${m.edge >= 0 ? 'more' : 'fewer'} wins per day than on shorter nights.`}
         </Text>
       </View>
@@ -745,10 +1400,12 @@ function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onAnalyz
 }
 
 /* ---------- Focus ---------- */
-function Focus({ onDone }) {
+function Focus({ onDone, suggest, log }) {
   const [mins, setMins] = useState(25);
   const [left, setLeft] = useState(25 * 60);
   const [running, setRunning] = useState(false);
+  const [brk, setBrk] = useState(false);
+  const [intent, setIntent] = useState('');
   const [msg, setMsg] = useState('');
   const endRef = useRef(0);
   useEffect(() => {
@@ -758,38 +1415,62 @@ function Focus({ onDone }) {
   }, [running]);
   useEffect(() => {
     if (running && left <= 0) {
-      setRunning(false); onDone(mins); setLeft(mins * 60);
-      setMsg(`Session complete. +15 XP for ${mins} focused minutes.`);
+      setRunning(false);
+      try { Vibration.vibrate([0, 400, 200, 400]); } catch (e) {}
+      if (brk) { setBrk(false); setLeft(mins * 60); setMsg('Break over. Ready for the next round?'); }
+      else { onDone(mins, intent.trim()); setLeft(mins * 60); setMsg(`Session complete. +15 XP for ${mins} focused minutes.`); }
     }
   }, [left, running]);
-  const pick = (m) => { if (!running) { setMins(m); setLeft(m * 60); setMsg(''); } };
+  const pick = (m) => { if (!running) { const v = Math.max(5, Math.min(180, m)); setMins(v); setLeft(v * 60); setBrk(false); setMsg(''); } };
   const toggle = () => {
     if (!running) { endRef.current = Date.now() + left * 1000; setMsg(''); }
     setRunning(!running);
   };
+  const startBreak = () => { setBrk(true); setLeft(300); endRef.current = Date.now() + 300000; setMsg(''); setRunning(true); };
+  const reset = () => { setRunning(false); setBrk(false); setLeft(mins * 60); };
   return (
-    <ScrollView contentContainerStyle={s.page}>
+    <ScrollView contentContainerStyle={s.page} keyboardShouldPersistTaps="handled">
       <Text style={s.h1}>Deep focus</Text>
       <Text style={[s.muted, { marginBottom: 16 }]}>Genius-level work needs uninterrupted attention. One task, phone away, nothing else open.</Text>
       <View style={s.chipRow}>
         {[15, 25, 45, 90].map((m) => (
-          <Pressable key={m} onPress={() => pick(m)} style={[s.chip, mins === m && { borderColor: C.accent, backgroundColor: C.raised }]}>
+          <Pressable key={m} onPress={() => pick(m)} style={[s.chip, mins === m && !brk && { borderColor: C.accent, backgroundColor: C.raised }]}>
             <Text style={s.chipText}>{m} min</Text>
           </Pressable>
         ))}
+        <Pressable onPress={() => pick(mins - 5)} style={s.chip}><Text style={s.chipText}>{'\u2212'}5</Text></Pressable>
+        <Pressable onPress={() => pick(mins + 5)} style={s.chip}><Text style={s.chipText}>+5</Text></Pressable>
       </View>
-      <Text style={s.timer}>{pad(Math.floor(left / 60))}:{pad(left % 60)}</Text>
+      <TextInput style={[s.addInput, { marginTop: 4 }]} value={intent} onChangeText={setIntent} editable={!running} placeholder="What will you work on? (optional)" placeholderTextColor={C.muted} keyboardAppearance="dark" />
+      {!!suggest && !intent && !running && (
+        <Pressable onPress={() => setIntent(suggest)} style={[s.chip, { alignSelf: 'flex-start', marginTop: 8 }]}><Text style={[s.chipText, { fontSize: 13 }]}>Use plan: {suggest}</Text></Pressable>
+      )}
+      <Text style={[s.muted, { textAlign: 'center', marginTop: 20 }]}>{brk ? 'Break' : 'Focus'}</Text>
+      <Text style={[s.timer, { marginTop: 4 }]}>{pad(Math.floor(left / 60))}:{pad(left % 60)}</Text>
       <View style={{ flexDirection: 'row', justifyContent: 'center' }}>
         <Pressable onPress={toggle} style={[s.addBtn, { paddingVertical: 14, paddingHorizontal: 32, marginLeft: 0 }]}>
-          <Text style={s.addBtnText}>{running ? 'Pause' : 'Start focus'}</Text>
+          <Text style={s.addBtnText}>{running ? 'Pause' : brk ? 'Resume break' : 'Start focus'}</Text>
         </Pressable>
-        <Pressable onPress={() => { setRunning(false); setLeft(mins * 60); }} style={[s.ghost, { marginLeft: 10, justifyContent: 'center' }]}>
+        <Pressable onPress={reset} style={[s.ghost, { marginLeft: 10, justifyContent: 'center' }]}>
           <Text style={s.ghostText}>Reset</Text>
         </Pressable>
       </View>
       {!!msg && <Text style={[s.empty, { color: C.online }]}>{msg}</Text>}
-      <View style={[s.card, { marginTop: 28 }]}>
-        <Text style={s.habitTitle}>Deep work rules</Text>
+      {!running && !brk && msg.startsWith('Session complete') && (
+        <Pressable onPress={startBreak} style={[s.planBtn, { alignSelf: 'center', paddingHorizontal: 24 }]}><Text style={s.planText}>Take a 5-minute break</Text></Pressable>
+      )}
+      <View style={[s.card, { marginTop: 24 }]}>
+        <Text style={[s.habitTitle, { flex: 0 }]}>Today's sessions</Text>
+        {log.length === 0 && <Text style={[s.muted, { marginTop: 8 }]}>No sessions yet today.</Text>}
+        {log.map((e, i) => (
+          <View key={i} style={[s.between, { marginTop: 8 }]}>
+            <Text style={[s.muted, { flex: 1 }]} numberOfLines={1}>{timeOf(e.ts)} · {e.intent || 'Deep work'}</Text>
+            <Text style={s.muted}>{e.mins} min</Text>
+          </View>
+        ))}
+      </View>
+      <View style={s.card}>
+        <Text style={[s.habitTitle, { flex: 0 }]}>Deep work rules</Text>
         <Text style={[s.muted, { marginTop: 8 }]}>1. Write the single outcome you want before you start.{'\n'}2. Phone in another room, notifications off.{'\n'}3. When distracted, note it on paper and return.{'\n'}4. After the session, rest 5 minutes away from screens.</Text>
       </View>
     </ScrollView>
@@ -840,14 +1521,63 @@ function Me({ profile, setProfile, memory, setMemory }) {
 }
 
 /* ---------- Coach ---------- */
-function Coach({ online, hasKey, messages, thinking, mode, setMode, onSend, onOpenSettings }) {
+const Bubble = React.memo(({ item, isLast, acts }) => {
+  const u = item.role === 'user';
+  const items = !u && !item.error ? listItems(item.text) : [];
+  const ap = item.applied;
+  return (
+    <View style={[s.row, { justifyContent: u ? 'flex-end' : 'flex-start' }]}>
+      <View style={{ maxWidth: '84%' }}>
+        <Pressable onLongPress={() => acts.del(item.id)} delayLongPress={450} style={[s.bubble, u ? s.bubbleU : s.bubbleA, item.error && { borderColor: C.offline }, { maxWidth: '100%' }]}>
+          <Text style={[s.bubbleText, item.error && { color: '#F87171' }]}>{item.text}</Text>
+        </Pressable>
+        {!!item.ts && <Text style={[s.barLbl, { marginTop: 3, textAlign: u ? 'right' : 'left' }]}>{timeOf(item.ts)}</Text>}
+        {!!ap && (ap.undone ? <Text style={[s.muted, { marginTop: 6, fontSize: 12 }]}>Plan undone.</Text> : (
+          <View style={s.applied}>
+            <View style={s.btnRow}><Icon n="checkmark-circle" size={16} color={C.online} /><Text style={[s.muted, { marginLeft: 6, color: C.online }]}>Applied to your app</Text></View>
+            {ap.lines.map((l, i) => <Text key={i} style={[s.muted, { marginTop: 3 }]}>• {l}</Text>)}
+            <View style={[s.btnRow, { justifyContent: 'flex-start', marginTop: 8 }]}>
+              <Pressable onPress={acts.today} style={s.logBtn}><Text style={s.logText}>Open Today</Text></Pressable>
+              <Pressable onPress={() => acts.undoPlan(item)} style={[s.logBtn, { marginLeft: 8 }]}><Text style={s.logText}>Undo</Text></Pressable>
+            </View>
+          </View>
+        ))}
+        {!u && (items.length >= 2 || item.error || isLast) && (
+          <View style={[s.btnRow, { justifyContent: 'flex-start', marginTop: 6, flexWrap: 'wrap' }]}>
+            {items.length >= 2 && (
+              <Pressable disabled={!!item.added} onPress={() => acts.addTasks(item.id, items)} style={[s.logBtn, { marginRight: 8, marginBottom: 4 }, item.added && { opacity: 0.5 }]}>
+                <Text style={s.logText}>{item.added ? 'Added to tasks' : `+ Add ${items.length} to tasks`}</Text>
+              </Pressable>
+            )}
+            {(item.error || isLast) && (
+              <Pressable onPress={acts.regen} style={[s.logBtn, { marginBottom: 4 }]}>
+                <View style={s.btnRow}><Icon n="refresh" size={13} /><Text style={[s.logText, { marginLeft: 5 }]}>{item.error ? 'Retry' : 'Regenerate'}</Text></View>
+              </Pressable>
+            )}
+          </View>
+        )}
+      </View>
+    </View>
+  );
+});
+
+function Coach({ online, hasKey, messages, thinking, mode, setMode, onSend, onOpenSettings, onClear, acts }) {
   const [input, setInput] = useState('');
   const listRef = useRef(null);
   const canSend = online && !thinking && input.trim().length > 0;
   const go = (t) => { onSend(t); setInput(''); };
+  const lastId = messages.length ? messages[messages.length - 1].id : null;
   return (
     <View style={{ flex: 1 }}>
-      <View style={s.coachModes}><CatChips value={mode} onChange={setMode} withAll /></View>
+      <View style={s.coachModes}>
+        <CatChips value={mode} onChange={setMode} withAll />
+        {messages.length > 0 && (
+          <View style={[s.between, { marginBottom: 4 }]}>
+            <Text style={s.muted}>{messages.length} message{messages.length > 1 ? 's' : ''} · long-press one to delete it</Text>
+            <Pressable onPress={onClear} hitSlop={8} style={s.btnRow}><Icon n="trash-outline" size={16} color="#F87171" /><Text style={[s.muted, { color: '#F87171', marginLeft: 5 }]}>Clear chat</Text></Pressable>
+          </View>
+        )}
+      </View>
       <FlatList
         ref={listRef}
         data={messages}
@@ -856,14 +1586,14 @@ function Coach({ online, hasKey, messages, thinking, mode, setMode, onSend, onOp
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
         onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
-        renderItem={renderBubble}
+        renderItem={({ item }) => <Bubble item={item} isLast={item.id === lastId && item.role !== 'user'} acts={acts} />}
         initialNumToRender={12}
         windowSize={7}
         removeClippedSubviews
         ListEmptyComponent={
           <View style={s.hero}>
             <Text style={s.heroTitle}>Become better, every day.</Text>
-            <Text style={s.heroSub}>Your coach knows your tasks and habits. Pick a pillar above, then ask.</Text>
+            <Text style={s.heroSub}>Your coach knows your tasks, habits, sleep and goals. Ask it to plan your day and the plan is applied across the app.</Text>
             {!hasKey && (
               <Pressable onPress={onOpenSettings} style={s.keyCta}><Text style={s.keyCtaText}>Add your free OpenRouter key to start</Text></Pressable>
             )}
@@ -896,31 +1626,72 @@ function Coach({ online, hasKey, messages, thinking, mode, setMode, onSend, onOp
   );
 }
 
-function SettingsModal({ visible, apiKey, onSave, onClear, onClose }) {
+function Opt({ label, value, opts, onPick, show }) {
+  return (
+    <View style={{ marginTop: 14 }}>
+      <Text style={s.fieldLabel}>{label}</Text>
+      <View style={s.chipRow}>
+        {opts.map((o) => (
+          <Pressable key={o} onPress={() => onPick(o)} style={[s.chip, { paddingVertical: 6 }, value === o && { borderColor: C.accent, backgroundColor: C.raised }]}>
+            <Text style={s.chipText}>{show ? show(o) : o}</Text>
+          </Pressable>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+function SettingsModal({ visible, apiKey, meta, setMeta, onSave, onClear, onExport, onImport, onClose }) {
   const [draft, setDraft] = useState(apiKey);
   const [err, setErr] = useState('');
-  useEffect(() => { setDraft(apiKey); setErr(''); }, [apiKey, visible]);
+  const [restore, setRestore] = useState(false), [paste, setPaste] = useState(''), [rmsg, setRmsg] = useState('');
+  useEffect(() => { setDraft(apiKey); setErr(''); setRestore(false); setPaste(''); setRmsg(''); }, [apiKey, visible]);
+  const doRestore = () => {
+    try { onImport(paste); setPaste(''); setRestore(false); setRmsg('Backup restored.'); } catch (e) { setRmsg(e.message || 'Could not restore that backup.'); }
+  };
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <KeyboardAvoidingView style={s.backdrop} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <View style={s.modal}>
-          <Text style={s.h1}>Settings</Text>
-          <Text style={[s.muted, { marginTop: 16, marginBottom: 8 }]}>OpenRouter API key</Text>
-          <TextInput style={s.keyInput} value={draft} onChangeText={setDraft} placeholder="Paste key (starts with sk-or-)"
-            placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} secureTextEntry keyboardAppearance="dark" />
-          <Text style={[s.muted, { marginTop: 12, fontSize: 13 }]}>
-            Stored only on this device. Get a free key at openrouter.ai/keys. Free models are run by third-party providers that may log or train on prompts, so keep sensitive details out of chats.
-          </Text>
-          {!!err && <Text style={[s.muted, { color: '#F87171', marginTop: 8 }]}>{err}</Text>}
-          <View style={[s.between, { marginTop: 20 }]}>
-            <Pressable style={s.ghost} onPress={onClear}><Text style={[s.ghostText, { color: '#F87171' }]}>Clear chat</Text></Pressable>
-            <View style={{ flexDirection: 'row' }}>
-              <Pressable style={s.ghost} onPress={onClose}><Text style={s.ghostText}>Close</Text></Pressable>
-              <Pressable style={[s.ghost, { backgroundColor: C.accent, marginLeft: 8 }]} onPress={() => { const k = draft.trim(); if (k && !k.startsWith('sk-or-')) return setErr('That does not look like an OpenRouter key. It should start with sk-or-.'); setErr(''); onSave(k); }}>
-                <Text style={[s.ghostText, { color: C.onAccent }]}>Save key</Text>
-              </Pressable>
+        <View style={[s.modal, { maxHeight: '90%' }]}>
+          <ScrollView keyboardShouldPersistTaps="handled">
+            <Text style={s.h1}>Settings</Text>
+            <Text style={[s.muted, { marginTop: 16, marginBottom: 8 }]}>OpenRouter API key</Text>
+            <TextInput style={s.keyInput} value={draft} onChangeText={setDraft} placeholder="Paste key (starts with sk-or-)"
+              placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} secureTextEntry keyboardAppearance="dark" />
+            <Text style={[s.muted, { marginTop: 12, fontSize: 13 }]}>
+              Stored only on this device. Get a free key at openrouter.ai/keys. Free models are run by third-party providers that may log or train on prompts, so keep sensitive details out of chats.
+            </Text>
+            {!!err && <Text style={[s.muted, { color: '#F87171', marginTop: 8 }]}>{err}</Text>}
+
+            <Opt label="Sleep target (hours)" value={meta.sleepTarget || 8} opts={[6, 7, 8, 9, 10]} onPick={(v) => setMeta((m) => ({ ...m, sleepTarget: v }))} />
+            <Opt label="Daily water goal (glasses)" value={meta.waterGoal || 8} opts={[6, 8, 10, 12]} onPick={(v) => setMeta((m) => ({ ...m, waterGoal: v }))} />
+            <Opt label="Keep chat history" value={meta.chatKeep || 60} opts={[20, 40, 60, 100, 200]} show={(v) => `Last ${v}`} onPick={(v) => setMeta((m) => ({ ...m, chatKeep: v }))} />
+            <Text style={[s.muted, { fontSize: 12, marginTop: 6 }]}>Older messages are trimmed automatically. Coach memory, plans and your data are never trimmed.</Text>
+
+            <Text style={[s.fieldLabel, { marginTop: 18 }]}>Backup</Text>
+            <View style={s.chipRow}>
+              <Pressable style={s.chip} onPress={onExport}><Text style={s.chipText}>Export backup</Text></Pressable>
+              <Pressable style={s.chip} onPress={() => { setRestore(!restore); setRmsg(''); }}><Text style={s.chipText}>Restore backup</Text></Pressable>
             </View>
-          </View>
+            {restore && (
+              <View>
+                <TextInput style={[s.keyInput, { minHeight: 90, textAlignVertical: 'top' }]} value={paste} onChangeText={setPaste} multiline placeholder="Paste your backup text here. This replaces your current data."
+                  placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} keyboardAppearance="dark" />
+                <Pressable onPress={doRestore} disabled={!paste.trim()} style={[s.wide, { backgroundColor: paste.trim() ? C.accent : C.disabled, marginTop: 8 }]}><Text style={s.addBtnText}>Restore now</Text></Pressable>
+              </View>
+            )}
+            {!!rmsg && <Text style={[s.muted, { marginTop: 6, color: rmsg.startsWith('Backup restored') ? C.online : '#F87171' }]}>{rmsg}</Text>}
+
+            <View style={[s.between, { marginTop: 22 }]}>
+              <Pressable style={s.ghost} onPress={onClear}><Text style={[s.ghostText, { color: '#F87171' }]}>Clear chat</Text></Pressable>
+              <View style={{ flexDirection: 'row' }}>
+                <Pressable style={s.ghost} onPress={onClose}><Text style={s.ghostText}>Close</Text></Pressable>
+                <Pressable style={[s.ghost, { backgroundColor: C.accent, marginLeft: 8 }]} onPress={() => { const k = draft.trim(); if (k && !k.startsWith('sk-or-')) return setErr('That does not look like an OpenRouter key. It should start with sk-or-.'); setErr(''); onSave(k); }}>
+                  <Text style={[s.ghostText, { color: C.onAccent }]}>Save key</Text>
+                </Pressable>
+              </View>
+            </View>
+          </ScrollView>
         </View>
       </KeyboardAvoidingView>
     </Modal>
@@ -939,23 +1710,42 @@ export default function App() {
   const [activity, setActivity] = useState({});
   const [focusMin, setFocusMin] = useState(0);
   const [cards, setCards] = useState([]);
-  const [meta, setMeta] = useState({ wake: 7, lock: false, sleep: {}, hours: {}, urges: 0, slips: 0, models: [], archive: [], focusDays: {}, reviews: { ok: 0, n: 0 }, mood: {}, rt: [], span: 0 });
+  const [meta, setMeta] = useState(DEFAULT_META);
   const [override, setOverride] = useState(false);
   const [shield, setShield] = useState(null);
   const [quizId, setQuizId] = useState(null);
-  const [, setTick] = useState(0);
+  const [tick, setTick] = useState(0);
+  const [toast, setToast] = useState(null);
+  const [confirm, setConfirm] = useState(null);
   const lastQuiz = useRef(0);
-  useEffect(() => { const t = setInterval(() => setTick((x) => x + 1), 60000); return () => clearInterval(t); }, []);
-  const pk = peakWindow(meta);
-  const nd = new Date(), nowH = nd.getHours() + nd.getMinutes() / 60;
-  const inPeak = nowH >= pk.start && nowH < pk.end;
-  useEffect(() => { if (!inPeak) setOverride(false); }, [inPeak]);
+  const toastId = useRef(0);
   const [messages, setMessages] = useState([]);
   const [mode, setMode] = useState('all');
   const [thinking, setThinking] = useState(false);
   const [apiKey, setApiKey] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const tasksRef = useRef(tasks); tasksRef.current = tasks;
+  const habitsRef = useRef(habits); habitsRef.current = habits;
+
+  useEffect(() => { const t = setInterval(() => setTick((x) => x + 1), 60000); return () => clearInterval(t); }, []);
+  const pk = peakWindow(meta);
+  const nd = new Date(), nowH = nd.getHours() + nd.getMinutes() / 60;
+  const inPeak = nowH >= pk.start && nowH < pk.end;
+  useEffect(() => { if (!inPeak) setOverride(false); }, [inPeak]);
+
+  const showToast = (text, undo) => {
+    const id = ++toastId.current;
+    setToast({ id, text, undo });
+    setTimeout(() => setToast((t) => (t && t.id === id ? null : t)), 7000);
+  };
+  const ask = (title, body, label, yes) => setConfirm({ title, body, label, yes });
+
+  const hydrate = (p) => {
+    setTasks(p.tasks || []); setHabits(p.habits || []); setXp(p.xp || 0); setMessages(p.messages || []);
+    setProfile(p.profile || {}); setMemory(p.memory || []); setActivity(p.activity || {}); setFocusMin(p.focusMin || 0);
+    setCards(p.cards || []); setMeta({ ...DEFAULT_META, ...(p.meta || {}) });
+  };
 
   useEffect(() => {
     (async () => {
@@ -963,12 +1753,7 @@ export default function App() {
         const k = await AsyncStorage.getItem(KEY_STORE);
         const d = (await AsyncStorage.getItem(DATA_STORE)) || (await AsyncStorage.getItem('grokbot:data'));
         if (k) setApiKey(k);
-        if (d) {
-          const p = JSON.parse(d);
-          setTasks(p.tasks || []); setHabits(p.habits || []); setXp(p.xp || 0); setMessages(p.messages || []);
-          setProfile(p.profile || {}); setMemory(p.memory || []); setActivity(p.activity || {}); setFocusMin(p.focusMin || 0);
-          setCards(p.cards || []); if (p.meta) setMeta((m) => ({ ...m, ...p.meta }));
-        }
+        if (d) hydrate(JSON.parse(d));
       } catch (e) {}
       setLoaded(true);
     })();
@@ -976,9 +1761,33 @@ export default function App() {
 
   useEffect(() => {
     if (!loaded) return;
-    const t = setTimeout(() => AsyncStorage.setItem(DATA_STORE, JSON.stringify({ tasks, habits, xp, profile, memory, activity, focusMin, cards, meta, messages: messages.slice(-60) })).catch(() => {}), 700);
+    const keep = meta.chatKeep || 60;
+    const t = setTimeout(() => AsyncStorage.setItem(DATA_STORE, JSON.stringify({ tasks, habits, xp, profile, memory, activity, focusMin, cards, meta, messages: messages.slice(-keep) })).catch(() => {}), 700);
     return () => clearTimeout(t);
   }, [tasks, habits, xp, profile, memory, activity, focusMin, cards, meta, messages, loaded]);
+
+  // Keeps the chat from growing forever: trims the oldest messages past your chosen limit
+  useEffect(() => {
+    const k = meta.chatKeep || 60;
+    if (messages.length > k + 10) setMessages((p) => p.slice(-k));
+  }, [messages.length, meta.chatKeep]);
+
+  // Recurring tasks come back on their own (daily, or weekly after 7 days)
+  useEffect(() => {
+    if (!loaded) return;
+    const t = dayKey(0);
+    const due = (x) => x.repeat && x.done && x.doneOn !== t && (x.repeat === 'daily' || !x.doneOn || daysBetween(x.doneOn, t) >= 7);
+    setTasks((p) => (p.some(due) ? p.map((x) => (due(x) ? { ...x, done: false, doneOn: undefined } : x)) : p));
+  }, [loaded, tick]);
+
+  const bdg = useMemo(() => badgeDefs(xp, focusMin, habits, cards, meta), [xp, focusMin, habits, cards, meta]);
+  useEffect(() => {
+    if (!loaded) return;
+    const have = meta.badges || [], fresh = bdg.filter((b) => b.ok && !have.includes(b.id));
+    if (!fresh.length) return;
+    setMeta((m) => ({ ...m, badges: [...(m.badges || []), ...fresh.map((b) => b.id)] }));
+    showToast(fresh.length === 1 ? `Badge unlocked: ${fresh[0].name}` : `${fresh.length} badges unlocked. Open Badges on Today.`);
+  }, [bdg, loaded]);
 
   const maybeQuiz = useCallback(() => {
     if (Date.now() - lastQuiz.current < 90000) return;
@@ -1003,10 +1812,15 @@ export default function App() {
     else setMeta((m) => ({ ...m, slips: m.slips + 1 }));
   };
   const bump = (n) => setActivity((a) => ({ ...a, [dayKey(0)]: Math.max(0, (a[dayKey(0)] || 0) + n) }));
-  const finishFocus = (m) => {
+  const finishFocus = (m, intent = '') => {
     const h = new Date(Date.now() - m * 60000).getHours();
     setXp((x) => x + 15); setFocusMin((f) => f + m); bump(1);
-    setMeta((mt) => ({ ...mt, hours: { ...mt.hours, [h]: (mt.hours[h] || 0) + 1 }, focusDays: { ...mt.focusDays, [dayKey(0)]: ((mt.focusDays || {})[dayKey(0)] || 0) + m } }));
+    setMeta((mt) => ({
+      ...mt,
+      hours: { ...mt.hours, [h]: (mt.hours[h] || 0) + 1 },
+      focusDays: { ...mt.focusDays, [dayKey(0)]: ((mt.focusDays || {})[dayKey(0)] || 0) + m },
+      focusLog: [...(mt.focusLog || []), { ts: Date.now(), mins: m, intent }].slice(-80),
+    }));
     setTimeout(maybeQuiz, 700);
   };
   const dump = (r) => {
@@ -1014,54 +1828,246 @@ export default function App() {
     setMeta((m) => ({ ...m, models: [...new Set([...r.models, ...m.models])].slice(0, 60), archive: [...r.archive, ...m.archive].slice(0, 100) }));
     bump(1);
   };
-  const addTask = (title, cat) => setTasks((p) => [{ id: uid(), title, cat, done: false }, ...p]);
+
+  /* Tasks and habits */
+  const addTask = (title, cat, repeat) => setTasks((p) => [{ id: uid(), title, cat, done: false, ...(repeat ? { repeat } : {}) }, ...p]);
+  // Keeps today's plan blocks in step with the task or habit they are linked to
+  const syncBlocks = (key, id, val) => setMeta((m) => {
+    const p = (m.plans || {})[dayKey(0)];
+    if (!p || !p.blocks.some((b) => b[key] === id)) return m;
+    return { ...m, plans: { ...m.plans, [p.date]: { ...p, blocks: p.blocks.map((b) => (b[key] === id ? { ...b, done: val } : b)) } } };
+  });
   const toggleTask = (id) => {
-    const t = tasks.find((x) => x.id === id);
+    const t = tasksRef.current.find((x) => x.id === id);
     if (!t) return;
-    setXp((x) => Math.max(0, x + (t.done ? -10 : 10)));
-    bump(t.done ? -1 : 1);
-    if (!t.done) setTimeout(maybeQuiz, 700);
-    setTasks((p) => p.map((x) => (x.id === id ? { ...x, done: !x.done } : x)));
+    const nd2 = !t.done;
+    setXp((x) => Math.max(0, x + (nd2 ? 10 : -10)));
+    bump(nd2 ? 1 : -1);
+    if (nd2) setTimeout(maybeQuiz, 700);
+    setTasks((p) => p.map((x) => (x.id === id ? { ...x, done: nd2, doneOn: nd2 ? dayKey(0) : undefined } : x)));
+    syncBlocks('taskId', id, nd2);
   };
   const addHabit = (title, cat) => setHabits((p) => [...p, { id: uid(), title, cat, log: [] }]);
   const toggleHabit = (id) => {
-    const h = habits.find((x) => x.id === id), today = dayKey(0);
+    const h = habitsRef.current.find((x) => x.id === id), today = dayKey(0);
     if (!h) return;
     const has = h.log.includes(today);
     setXp((x) => Math.max(0, x + (has ? -5 : 5)));
     bump(has ? -1 : 1);
     if (!has) setTimeout(maybeQuiz, 700);
     setHabits((p) => p.map((x) => (x.id === id ? { ...x, log: has ? x.log.filter((d) => d !== today) : [...x.log, today] } : x)));
+    syncBlocks('habitId', id, !has);
+  };
+  const deleteTask = (id) => {
+    const i = tasks.findIndex((x) => x.id === id);
+    if (i < 0) return;
+    const t = tasks[i];
+    setTasks((p) => p.filter((x) => x.id !== id));
+    showToast(`Deleted "${t.title}"`, () => setTasks((p) => { const c = [...p]; c.splice(Math.min(i, c.length), 0, t); return c; }));
+  };
+  const deleteHabit = (id) => {
+    const i = habits.findIndex((x) => x.id === id);
+    if (i < 0) return;
+    const h = habits[i];
+    setHabits((p) => p.filter((x) => x.id !== id));
+    showToast(`Deleted habit "${h.title}"`, () => setHabits((p) => { const c = [...p]; c.splice(Math.min(i, c.length), 0, h); return c; }));
+  };
+  const clearDone = () => {
+    const gone = tasks.filter((t) => t.done);
+    if (!gone.length) return;
+    setTasks((p) => p.filter((t) => !t.done));
+    showToast(`Cleared ${gone.length} completed task${gone.length > 1 ? 's' : ''}`, () => setTasks((p) => [...p, ...gone]));
+  };
+  const starTask = (id) => setTasks((p) => p.map((t) => (t.id === id ? { ...t, star: !t.star } : t)));
+  const cycleRepeat = (id) => setTasks((p) => p.map((t) => (t.id === id ? { ...t, repeat: t.repeat === 'daily' ? 'weekly' : undefined } : t)));
+  const changeWater = (d) => {
+    const k = dayKey(0), cur = (meta.water || {})[k] || 0, wg = meta.waterGoal || 8, nx = Math.max(0, Math.min(30, cur + d));
+    if (nx === cur) return;
+    setMeta((m) => ({ ...m, water: { ...m.water, [k]: nx } }));
+    if (cur < wg && nx >= wg) { setXp((x) => x + 5); bump(1); }
+    if (cur >= wg && nx < wg) { setXp((x) => Math.max(0, x - 5)); bump(-1); }
+  };
+  const saveJournal = (text, prompt) => {
+    const k = dayKey(0), first = !(meta.journal || []).some((j) => j.date === k);
+    setMeta((m) => ({ ...m, journal: [{ id: uid(), date: k, ts: Date.now(), text, prompt }, ...(m.journal || [])].slice(0, 300) }));
+    if (first) { setXp((x) => x + 5); bump(1); }
   };
 
-  const send = useCallback(async (raw) => {
-    const text = raw.trim();
-    if (!online || !text || thinking) return;
-    if (!apiKey) { setShowSettings(true); return; }
-    const u = { id: uid(), role: 'user', text };
-    const history = [...messages.filter((m) => !m.error), u];
-    setMessages((p) => [...p, u]); // instant user bubble
+  /* Plan blocks and plan application */
+  const setBlock = (id, v) => setMeta((m) => {
+    const p = (m.plans || {})[dayKey(0)];
+    if (!p) return m;
+    return { ...m, plans: { ...m.plans, [p.date]: { ...p, blocks: p.blocks.map((b) => (b.id === id ? { ...b, done: v } : b)) } } };
+  });
+  const toggleBlock = (id) => {
+    const p = (meta.plans || {})[dayKey(0)], b = p && p.blocks.find((x) => x.id === id);
+    if (!b) return;
+    const nd2 = !b.done;
+    const t = b.taskId && tasksRef.current.find((x) => x.id === b.taskId);
+    const h = b.habitId && habitsRef.current.find((x) => x.id === b.habitId);
+    if (t) { if (t.done !== nd2) toggleTask(t.id); else setBlock(id, nd2); return; }
+    if (h) { if (h.log.includes(dayKey(0)) !== nd2) toggleHabit(h.id); else setBlock(id, nd2); return; }
+    setBlock(id, nd2);
+    setXp((x) => Math.max(0, x + (nd2 ? 5 : -5)));
+    bump(nd2 ? 1 : -1);
+  };
+  const applyPlan = (pl, date) => {
+    const pid = uid(), hs = habitsRef.current, open = tasksRef.current.filter((t) => !t.done);
+    const fresh = pl.tasks.filter((t) => !open.some((o) => sameish(o.title, t.title))).map((t) => ({ id: uid(), title: t.title, cat: t.cat, done: false, planId: pid }));
+    let star = null;
+    if (pl.focus) {
+      const hit = [...fresh, ...open].find((t) => sameish(t.title, pl.focus));
+      if (hit) star = hit.id;
+      else { const f = { id: uid(), title: pl.focus, cat: guessCat(pl.focus), done: false, star: true, planId: pid }; fresh.push(f); star = f.id; }
+    }
+    fresh.forEach((t) => { if (t.id === star) t.star = true; });
+    const pool = [...fresh, ...open];
+    const blocks = pl.blocks.map((b) => {
+      const t = pool.find((x) => (b.ref && sameish(x.title, b.ref)) || sameish(x.title, b.title));
+      const h = !t && hs.find((x) => (b.ref && sameish(x.title, b.ref)) || sameish(x.title, b.title));
+      return { id: uid(), start: b.start, end: b.end, title: b.title, cat: b.cat, done: !!(h && date === dayKey(0) && h.log.includes(dayKey(0))), ...(t ? { taskId: t.id } : h ? { habitId: h.id } : {}) };
+    });
+    setTasks((p) => [...fresh, ...p.map((t) => (t.id === star ? { ...t, star: true } : t))]);
+    setMeta((m) => ({ ...m, plans: prunePlans({ ...(m.plans || {}), [date]: { id: pid, date, focus: pl.focus, blocks } }) }));
+    const lines = [`${blocks.length} time blocks ${date === dayKey(0) ? 'on Today' : 'saved for tomorrow'}`];
+    if (fresh.length) lines.push(`${fresh.length} task${fresh.length > 1 ? 's' : ''} added: ${fresh.slice(0, 3).map((t) => t.title).join(', ')}${fresh.length > 3 ? '…' : ''}`);
+    const linked = blocks.filter((b) => b.taskId || b.habitId).length;
+    if (linked) lines.push(`${linked} block${linked > 1 ? 's' : ''} linked to your tasks and habits`);
+    if (pl.focus) lines.push(`Priority: ${pl.focus}`);
+    return { date, pid, taskIds: fresh.map((t) => t.id), lines };
+  };
+  const undoPlan = (msg) => {
+    const a = msg.applied;
+    if (!a || a.undone) return;
+    setMeta((mt) => { const pl = { ...(mt.plans || {}) }; if (pl[a.date] && pl[a.date].id === a.pid) delete pl[a.date]; return { ...mt, plans: pl }; });
+    setTasks((p) => p.filter((t) => !(a.taskIds.includes(t.id) && !t.done)));
+    setMessages((p) => p.map((x) => (x.id === msg.id ? { ...x, applied: { ...a, undone: true } } : x)));
+  };
+  const clearPlan = () => {
+    const key = dayKey(0), prev = (meta.plans || {})[key];
+    if (!prev) return;
+    setMeta((m) => { const pl = { ...(m.plans || {}) }; delete pl[key]; return { ...m, plans: pl }; });
+    showToast('Plan cleared', () => setMeta((m) => ({ ...m, plans: { ...(m.plans || {}), [key]: prev } })));
+  };
+
+  /* Coach */
+  const coachContext = (isPlan, off) => {
+    const d = new Date(), now = d.getHours() + d.getMinutes() / 60, si = sleepInfo(meta), tk = dayKey(0), pl = (meta.plans || {})[tk];
+    const goals = (meta.goals || []).filter((g) => !g.done).map((g) => `- [${g.cat}] ${g.title} (${g.current}/${g.target})`).join('\n') || '(none)';
+    const lines = [
+      `Time now: ${fmt(now)}. Usual wake time: ${fmt(meta.wake)}. Peak focus window: ${fmt(pk.start)} to ${fmt(pk.end)}. Target bedtime: ${fmt(si.bedTonight)} (sleep target ${si.target}h).`,
+      `Sleep: last night ${si.last == null ? 'not logged' : hm(si.last)}; 7-night average ${si.avg7 == null ? 'n/a' : hm(si.avg7)}; sleep debt ${si.debt.toFixed(1)}h; bedtime consistency ${si.spread == null ? 'n/a' : `+/-${si.spread} min`}.`,
+      `Water today: ${(meta.water || {})[tk] || 0}/${meta.waterGoal || 8}. Energy today (1-5): ${((meta.mood || {})[tk] || {}).e ?? 'not logged'}.`,
+      `Active goals:\n${goals}`,
+      pl ? `Today's plan already applied in the app: ${pl.blocks.map((b) => `${fmt(b.start)} ${b.title}${b.done ? ' (done)' : ''}`).join('; ')}` : 'No plan applied for today yet.',
+    ];
+    if (isPlan) lines.push(planRules(off ? 'tomorrow' : 'today', dayKey(off), now, off, si.bedTonight));
+    return lines.join('\n');
+  };
+  const run = async (history, text, opts = {}) => {
     setThinking(true);
+    const isPlan = PLAN_RE.test(text), off = isPlan ? planOffset(text) : 0;
     try {
-      const reply = await askAI(apiKey, history, buildSystem(mode, tasks, habits, profile, memory));
-      const facts = [...reply.matchAll(/\[\[remember:\s*([\s\S]+?)\]\]/gi)].map((m) => m[1].trim());
-      const clean = reply.replace(/\[\[remember:[\s\S]*?\]\]/gi, '').trim() || reply;
+      const raw = await askAI(apiKey, history, buildSystem(mode, tasksRef.current, habitsRef.current, profile, memory, { extra: coachContext(isPlan, off) }), isPlan ? 1800 : 1200);
+      const facts = [...raw.matchAll(/\[\[remember:\s*([\s\S]+?)\]\]/gi)].map((m) => m[1].trim());
+      const stripped = raw.replace(/\[\[remember:[\s\S]*?\]\]/gi, '').trim() || raw;
       if (facts.length) setMemory((m) => [...new Set([...m, ...facts])].slice(-40));
-      setMessages((p) => [...p, { id: uid(), role: 'ai', text: clean }]);
+      let msg = { id: uid(), role: 'ai', text: stripped.replace(PLAN_TAG, '').trim() || stripped, ts: Date.now() };
+      if (isPlan) {
+        const { text: shown, plan } = extractPlan(stripped);
+        if (plan) {
+          const r = applyPlan(plan, dayKey(off));
+          msg = { ...msg, text: shown, applied: { date: r.date, pid: r.pid, taskIds: r.taskIds, lines: r.lines } };
+          if (opts.stay) showToast(off ? 'Plan saved for tomorrow' : 'Plan applied to Today');
+        } else {
+          msg = { ...msg, text: `${shown}\n\n(I could not turn this into app changes automatically. Ask again and I will retry.)` };
+          if (opts.stay) showToast('Coach replied, but the plan could not be applied. Check the Coach tab and retry.');
+        }
+      }
+      setMessages((p) => [...p, msg]);
     } catch (e) {
-      setMessages((p) => [...p, { id: uid(), role: 'ai', text: e.message || 'Something went wrong.', error: true }]);
+      const text2 = e.message || 'Something went wrong.';
+      setMessages((p) => [...p, { id: uid(), role: 'ai', text: text2, error: true, ts: Date.now() }]);
+      if (opts.stay) showToast(text2);
     } finally {
       setThinking(false);
     }
-  }, [online, thinking, apiKey, messages, mode, tasks, habits, profile, memory]);
+  };
+  const send = (raw, opts) => {
+    const text = raw.trim();
+    if (!online || !text || thinking) return;
+    if (!apiKey) { setShowSettings(true); return; }
+    const u = { id: uid(), role: 'user', text, ts: Date.now() };
+    const history = [...messages.filter((m) => !m.error), u];
+    setMessages((p) => [...p, u]);
+    run(history, text, opts);
+  };
+  const regen = () => {
+    if (thinking || !online) return;
+    const i = messages.map((m) => m.role).lastIndexOf('user');
+    if (i < 0) return;
+    const base = messages.slice(0, i + 1);
+    setMessages(base);
+    run(base.filter((m) => !m.error), base[i].text);
+  };
+  const planNow = () => {
+    if (thinking) return;
+    const late = new Date().getHours() >= 21;
+    send(`Plan my day${late ? ' tomorrow' : ' today'}. Use my open tasks, habits, goals, sleep and peak window, and time-block it. Tell me the one thing that matters most.`, { stay: true });
+  };
+  const deleteMsg = (id) => {
+    const i = messages.findIndex((m) => m.id === id);
+    if (i < 0) return;
+    const m = messages[i];
+    setMessages((p) => p.filter((x) => x.id !== id));
+    showToast('Message deleted', () => setMessages((p) => { const c = [...p]; c.splice(Math.min(i, c.length), 0, m); return c; }));
+  };
+  const addReplyTasks = (id, items) => {
+    const have = tasksRef.current.filter((t) => !t.done);
+    const fresh = items.filter((x) => !have.some((t) => sameish(t.title, x))).map((x) => ({ id: uid(), title: x, cat: mode === 'all' ? guessCat(x) : mode, done: false }));
+    if (fresh.length) setTasks((p) => [...fresh, ...p]);
+    setMessages((p) => p.map((m) => (m.id === id ? { ...m, added: true } : m)));
+    showToast(fresh.length ? `Added ${fresh.length} task${fresh.length > 1 ? 's' : ''} to Today` : 'Those are already in your tasks', fresh.length ? () => setTasks((p) => p.filter((t) => !fresh.some((f) => f.id === t.id))) : undefined);
+  };
+  const requestClear = () => {
+    if (!messages.length) { showToast('The chat is already empty'); return; }
+    ask('Clear this chat?', `This removes ${messages.length} message${messages.length > 1 ? 's' : ''}. Your coach memory, profile, tasks and plans stay. You can undo for a few seconds afterwards.`, 'Clear chat', () => {
+      const prev = messages;
+      setMessages([]);
+      showToast('Chat cleared', () => setMessages(prev));
+    });
+  };
 
+  /* Backup */
+  const exportData = async () => {
+    try { await Share.share({ message: JSON.stringify({ app: 'autokinetics', v: 2, exported: new Date().toISOString(), tasks, habits, xp, profile, memory, activity, focusMin, cards, meta, messages: messages.slice(-30) }) }); }
+    catch (e) { showToast('Sharing is not available here.'); }
+  };
+  const importData = (text) => {
+    let p;
+    try { p = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)); } catch (e) { throw new Error('Could not read that. Paste the full backup text.'); }
+    if (!p || !Array.isArray(p.tasks) || !Array.isArray(p.habits)) throw new Error('That does not look like an AutoKinetics backup.');
+    hydrate(p);
+    showToast('Backup restored');
+  };
   const saveKey = async (k) => {
     setApiKey(k);
     try { await AsyncStorage.setItem(KEY_STORE, k); } catch (e) {}
     setShowSettings(false);
   };
 
+  const plan = (meta.plans || {})[dayKey(0)] || null, tomorrowPlan = (meta.plans || {})[dayKey(1)] || null;
+  const score = dayScore(tasks, habits, meta, plan);
+  const nudgeList = nudges({ meta, habits, cards, plan, pk, inPeak, online });
+  const nextBlock = plan && plan.blocks.find((b) => !b.done && nowH < b.end);
+  const focusLog = (meta.focusLog || []).filter((e) => keyOf(e.ts) === dayKey(0));
+  const acts = { del: deleteMsg, addTasks: addReplyTasks, regen, undoPlan, today: () => setTab('today') };
+
+  const SUBS = ['sleep', 'journal', 'goals', 'badges', 'review'];
   const view = meta.lock && inPeak && !override && ['habits', 'coach', 'me', 'learn'].includes(tab) ? 'gate' : tab;
+  const hl = SUBS.includes(tab) ? 'today' : tab;
+  const back = () => setTab('today');
+  const analyze = (t) => { setMode('all'); setTab('coach'); send(t); };
   const TABS = [{ id: 'today', icon: 'checkmark-circle', label: 'Today' }, { id: 'habits', icon: 'flame', label: 'Habits' }, { id: 'focus', icon: 'timer', label: 'Focus' }, { id: 'learn', icon: 'albums', label: 'Learn' }, { id: 'dump', icon: 'create', label: 'Dump' }, { id: 'stats', icon: 'stats-chart', label: 'Stats' }, { id: 'coach', icon: 'chatbubble-ellipses', label: 'Coach' }, { id: 'me', icon: 'person', label: 'Me' }];
 
   return (
@@ -1084,37 +2090,42 @@ export default function App() {
           {view === 'gate' && <Gate end={fmt(pk.end)} onFocus={() => setTab('focus')} onOverride={() => setShield('override')} />}
           {view === 'learn' && <Learn cards={cards} setCards={setCards} online={online} apiKey={apiKey} onOpenSettings={() => setShowSettings(true)} onReview={() => { lastQuiz.current = 0; maybeQuiz(); }} />}
           {view === 'dump' && <Dump meta={meta} onDump={dump} />}
-          {view === 'stats' && <Stats tasks={tasks} habits={habits} activity={activity} cards={cards} meta={meta} setMeta={setMeta} online={online}
-            onAnalyze={(t) => { setMode('all'); setTab('coach'); send(t); }} />}
+          {view === 'stats' && <Stats tasks={tasks} habits={habits} activity={activity} cards={cards} meta={meta} setMeta={setMeta} online={online} onOpen={setTab} onAnalyze={analyze} />}
           {view === 'today' && (
-            <Today tasks={tasks} habits={habits} xp={xp} online={online} activity={activity} focusMin={focusMin} meta={meta} setMeta={setMeta} pk={pk} inPeak={inPeak} onUrge={() => setShield('urge')} onToggle={toggleTask} onAdd={addTask}
-              onDelete={(id) => setTasks((p) => p.filter((t) => t.id !== id))}
-              onPlan={() => { setMode('all'); setTab('coach'); send('Build my plan for today using my open tasks and habits. Time-block it and tell me the one thing that matters most.'); }} />
+            <Today name={(profile.name || '').trim()} tasks={tasks} habits={habits} xp={xp} online={online} busy={thinking} activity={activity} focusMin={focusMin}
+              meta={meta} setMeta={setMeta} pk={pk} inPeak={inPeak} plan={plan} tomorrowPlan={tomorrowPlan} score={score} nudgeList={nudgeList}
+              onOpen={setTab} onUrge={() => setShield('urge')} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} onPlan={planNow}
+              onStar={starTask} onRepeat={cycleRepeat} onClearDone={clearDone} onToggleBlock={toggleBlock} onClearPlan={clearPlan} onWater={changeWater} />
           )}
-          {view === 'habits' && (
-            <Habits habits={habits} onToggle={toggleHabit} onAdd={addHabit} onDelete={(id) => setHabits((p) => p.filter((h) => h.id !== id))} />
-          )}
-          {view === 'focus' && <Focus onDone={finishFocus} />}
+          {view === 'habits' && <Habits habits={habits} onToggle={toggleHabit} onAdd={addHabit} onDelete={deleteHabit} />}
+          {view === 'focus' && <Focus onDone={finishFocus} suggest={nextBlock ? nextBlock.title : ''} log={focusLog} />}
           {view === 'me' && <Me profile={profile} setProfile={setProfile} memory={memory} setMemory={setMemory} />}
           {view === 'coach' && (
             <Coach online={online} hasKey={!!apiKey} messages={messages} thinking={thinking} mode={mode} setMode={setMode}
-              onSend={send} onOpenSettings={() => setShowSettings(true)} />
+              onSend={send} onOpenSettings={() => setShowSettings(true)} onClear={requestClear} acts={acts} />
           )}
+          {view === 'sleep' && <Sleep meta={meta} setMeta={setMeta} activity={activity} onBack={back} />}
+          {view === 'journal' && <Journal meta={meta} setMeta={setMeta} onSave={saveJournal} onBack={back} />}
+          {view === 'goals' && <Goals meta={meta} setMeta={setMeta} onXp={(d) => setXp((x) => Math.max(0, x + d))} onBack={back} />}
+          {view === 'badges' && <Badges list={bdg} onBack={back} />}
+          {view === 'review' && <Review habits={habits} activity={activity} meta={meta} online={online} onBack={back} onAnalyze={analyze} />}
         </KeyboardAvoidingView>
 
         <View style={s.tabBar}>
           {TABS.map((t) => (
             <Pressable key={t.id} onPress={() => setTab(t.id)} style={s.tab}>
-              <Icon n={tab === t.id ? t.icon : `${t.icon}-outline`} size={22} color={tab === t.id ? C.text : C.muted} />
-              <Text style={[s.tabLabel, tab === t.id && { color: C.text }]}>{t.label}</Text>
+              <Icon n={hl === t.id ? t.icon : `${t.icon}-outline`} size={22} color={hl === t.id ? C.text : C.muted} />
+              <Text style={[s.tabLabel, hl === t.id && { color: C.text }]}>{t.label}</Text>
             </Pressable>
           ))}
         </View>
 
         <Shield visible={!!shield} context={shield === 'override' ? 'You are about to break your Peak Lock.' : 'You feel an urge to escape the hard thing.'} onChoose={shieldChoose} />
         <MicroQuiz card={cards.find((c) => c.id === quizId)} onRate={rateCard} onClose={() => setQuizId(null)} />
-        <SettingsModal visible={showSettings} apiKey={apiKey} onSave={saveKey}
-          onClear={() => { setMessages([]); setShowSettings(false); }} onClose={() => setShowSettings(false)} />
+        <SettingsModal visible={showSettings} apiKey={apiKey} meta={meta} setMeta={setMeta} onSave={saveKey} onExport={exportData} onImport={importData}
+          onClear={() => { setShowSettings(false); setTimeout(requestClear, 350); }} onClose={() => setShowSettings(false)} />
+        <Confirm c={confirm} onNo={() => setConfirm(null)} />
+        <Toast toast={toast} onUndo={() => { const f = toast && toast.undo; setToast(null); if (f) f(); }} onClose={() => setToast(null)} />
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -1225,4 +2236,14 @@ const s = StyleSheet.create({
   grid: { flexDirection: 'row', flexWrap: 'wrap', width: 7 * 22 },
   px: { width: 18, height: 18, margin: 2, borderRadius: 4 },
   fieldLabel: { color: C.text, fontSize: 15, fontWeight: '600', marginBottom: 6 },
+  stepBtn: { minWidth: 36, height: 36, borderRadius: 10, borderWidth: 1, borderColor: C.border, backgroundColor: C.raised, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 8 },
+  stepVal: { color: C.text, fontSize: 18, fontWeight: '700', minWidth: 90, textAlign: 'center', fontVariant: ['tabular-nums'] },
+  planRow: { flexDirection: 'row', alignItems: 'center', padding: 10, borderRadius: 12, borderWidth: 1, borderColor: 'transparent', marginBottom: 4 },
+  toolRow: { flexDirection: 'row', marginBottom: 12, marginRight: -6 },
+  tool: { flex: 1, alignItems: 'center', backgroundColor: C.surface, borderWidth: 1, borderColor: C.border, borderRadius: 14, paddingVertical: 10, marginRight: 6 },
+  glass: { width: 18, height: 22, margin: 3, borderRadius: 5, borderWidth: 1.5, borderColor: C.disabled },
+  applied: { marginTop: 6, backgroundColor: C.surface, borderWidth: 1, borderColor: '#14532D', borderRadius: 14, padding: 12 },
+  toastWrap: { position: 'absolute', left: 16, right: 16, alignItems: 'center' },
+  toast: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#1C1C20', borderWidth: 1, borderColor: C.border, borderRadius: 14, paddingHorizontal: 16, paddingVertical: 12, width: '100%', maxWidth: 520, elevation: 8 },
+  toastBtn: { color: '#60A5FA', fontWeight: '700', fontSize: 14, marginLeft: 12 },
 });
