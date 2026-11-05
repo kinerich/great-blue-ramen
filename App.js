@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AppState, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView,
-  Share, StatusBar, StyleSheet, Text, TextInput, Vibration, View,
+  Share, StatusBar, StyleSheet, Text, TextInput, useWindowDimensions, Vibration, View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import NetInfo from '@react-native-community/netinfo';
@@ -57,6 +57,7 @@ const velocity = (habits) => {
 };
 // Peak cognitive window: learned from your focus sessions, else wake time + sleep
 const peakWindow = (meta) => {
+  if (meta.peakOverride) return { start: meta.peakOverride.start, end: meta.peakOverride.end, learned: true, custom: true };
   const hrs = meta.hours || {}, total = Object.values(hrs).reduce((a, b) => a + b, 0);
   const best = Object.keys(hrs).sort((a, b) => hrs[b] - hrs[a])[0];
   const sleep = sleepNow(meta) ?? 7, short = sleep < 6;
@@ -235,7 +236,7 @@ const dayScore = (tasks, habits, meta, plan) => {
 };
 
 /* Smart nudges: rule-based, work offline */
-const nudges = ({ meta, habits, cards, plan, pk, inPeak, online }) => {
+const nudges = ({ meta, habits, cards, plan, pk, inPeak, online, limit = 2 }) => {
   const d = new Date(), now = d.getHours() + d.getMinutes() / 60, si = sleepInfo(meta), out = [], t = dayKey(0);
   const left = habits.filter((h) => !h.log.includes(t)).length, water = (meta.water || {})[t] || 0, wg = meta.waterGoal || 8;
   const toBed = (((si.bedTonight - now) % 24) + 24) % 24, past = (((now - si.bedTonight) % 24) + 24) % 24;
@@ -252,7 +253,21 @@ const nudges = ({ meta, habits, cards, plan, pk, inPeak, online }) => {
   if (water < wg / 2 && now >= 14) out.push({ icon: 'water-outline', text: `Water is low: ${water}/${wg}.`, go: null });
   const due = cards.filter((c) => c.due <= t).length;
   if (due) out.push({ icon: 'albums-outline', text: `${due} flashcard${due > 1 ? 's' : ''} due for review.`, go: 'learn' });
-  return out.slice(0, 2);
+  const ppl = meta.people || [], odp = ppl.filter((p) => dueIn(p) <= 0);
+  if (odp.length) out.push({ icon: 'people-outline', text: `Reach out to ${odp[0].name}${odp.length > 1 ? ` and ${odp.length - 1} more` : ''}. Relationships compound.`, go: 'people' });
+  const bds = ppl.map((p) => ({ p, n: bdayIn(p.bday) })).filter((x) => x.n !== null && x.n <= 3).sort((a, b) => a.n - b.n);
+  if (bds.length) out.push({ icon: 'gift-outline', text: bds[0].n === 0 ? `${bds[0].p.name}'s birthday is today.` : `${bds[0].p.name}'s birthday is in ${bds[0].n} day${bds[0].n > 1 ? 's' : ''}.`, go: 'people' });
+  const dec = (meta.decisions || []).filter((x) => !x.outcome && x.review <= t).length;
+  if (dec) out.push({ icon: 'scale-outline', text: `${dec} decision${dec > 1 ? 's' : ''} ready to review. Calibrate your judgment.`, go: 'decisions' });
+  if (now >= 20 && !(meta.shutdown || {})[t]) out.push({ icon: 'power-outline', text: 'Run your evening shutdown and set tomorrow up tonight.', go: 'shutdown' });
+  const fs = meta.fast && meta.fast.start;
+  if (fs && (Date.now() - fs) / 36e5 >= (meta.fast.goal || 16)) out.push({ icon: 'hourglass-outline', text: 'Your fasting goal is reached. End the fast when you are ready.', go: 'fasting' });
+  const cdn = (meta.countdowns || []).filter((c) => { const n = daysUntil(c.date); return n >= 0 && n <= 3; });
+  if (cdn.length) out.push({ icon: 'alarm-outline', text: `${cdn[0].title} is ${daysUntil(cdn[0].date) === 0 ? 'today' : `in ${daysUntil(cdn[0].date)} days`}.`, go: 'countdowns' });
+  if ((meta.budget || 0) > 0 && spentIn(meta.expenses || [], monthKey(0)) > meta.budget) out.push({ icon: 'cash-outline', text: 'You are over your monthly budget.', go: 'expenses' });
+  const rdone = ((((meta.routines || {}).done || {})[t] || {}).morning) || [], msteps = (meta.routines || {}).morning || DEFAULT_ROUTINES.morning;
+  if (now >= 7 && now < 11 && rdone.length < msteps.length) out.push({ icon: 'sunny-outline', text: 'Your morning routine is not done yet.', go: 'routines' });
+  return out.slice(0, limit);
 };
 
 /* Badges: derived from your data, nothing extra to store except which ones were announced */
@@ -275,6 +290,17 @@ const badgeDefs = (xp, focusMin, habits, cards, meta) => {
     { id: 'cards10', icon: 'albums-outline', name: 'Memory Master', desc: 'Master 10 flashcards', cur: cards.filter((c) => c.box >= 4).length, need: 10 },
     { id: 'urge10', icon: 'hand-left-outline', name: 'Impulse Master', desc: 'Resist 10 urges', cur: meta.urges || 0, need: 10 },
     { id: 'goal1', icon: 'trophy-outline', name: 'Goal Getter', desc: 'Complete a goal', cur: (meta.goals || []).filter((g) => g.done).length, need: 1 },
+    { id: 'lift10', icon: 'barbell-outline', name: 'Lifter', desc: 'Train on 10 different days', cur: new Set((meta.workouts || []).map((w) => keyOf(w.ts))).size, need: 10 },
+    { id: 'calm60', icon: 'leaf-outline', name: 'Calm Mind', desc: '60 minutes of breathwork or meditation', cur: Math.floor(sum(Object.values(meta.calm || {}))), need: 60 },
+    { id: 'books3', icon: 'library-outline', name: 'Bookworm', desc: 'Finish 3 books', cur: (meta.books || []).filter((b) => b.done).length, need: 3 },
+    { id: 'skill10', icon: 'school-outline', name: 'Practitioner', desc: '10 hours of skill practice', cur: Math.floor(sum((meta.skills || []).map(skillMins)) / 60), need: 10 },
+    { id: 'calib5', icon: 'scale-outline', name: 'Calibrated', desc: 'Review 5 decisions', cur: (meta.decisions || []).filter((d) => d.outcome).length, need: 5 },
+    { id: 'notes25', icon: 'bulb-outline', name: 'Second Brain', desc: 'Capture 25 notes', cur: (meta.notes || []).length, need: 25 },
+    { id: 'net5', icon: 'people-outline', name: 'Networker', desc: 'Track 5 important people', cur: (meta.people || []).length, need: 5 },
+    { id: 'shut7', icon: 'power-outline', name: 'Closer', desc: 'Complete 7 evening shutdowns', cur: Object.keys(meta.shutdown || {}).length, need: 7 },
+    { id: 'track10', icon: 'stopwatch-outline', name: 'Time Aware', desc: 'Track 10 time entries', cur: (meta.timeLog || []).length, need: 10 },
+    { id: 'iron14', icon: 'ban-outline', name: 'Iron Will', desc: '14 clean days on a bad habit', cur: Math.max(0, ...(meta.anti || []).map((x) => daysBetween(x.slips.slice().sort().pop() || x.start, dayKey(0)))), need: 14 },
+    { id: 'think12', icon: 'construct-outline', name: 'Thinker', desc: 'Apply 12 mental models', cur: Object.keys(meta.mmApplied || {}).length, need: 12 },
   ].map((b) => ({ ...b, ok: b.cur >= b.need }));
 };
 
@@ -289,7 +315,349 @@ const DEFAULT_META = {
   wake: 7, lock: false, sleep: {}, sleepLog: {}, sleepStart: null, sleepTarget: 8, hours: {}, urges: 0, slips: 0,
   models: [], archive: [], focusDays: {}, focusLog: [], reviews: { ok: 0, n: 0 }, mood: {}, rt: [], span: 0,
   plans: {}, water: {}, waterGoal: 8, journal: [], goals: [], badges: [], chatKeep: 60,
+  unit: 'kg', nut: { cal: 2200, p: 140 }, cur: '$', budget: 0, favs: ['sleep', 'journal', 'goals', 'review'], awarded: {}, peakOverride: null,
 };
+
+/* ---------- Life OS: shared context, helpers, data libraries ---------- */
+const AppCtx = React.createContext({});
+const useApp = () => React.useContext(AppCtx);
+const useMeta = (key, init) => {
+  const { meta, setMeta } = useApp();
+  const val = meta[key] ?? init;
+  const set = (f) => setMeta((m) => ({ ...m, [key]: typeof f === 'function' ? f(m[key] ?? init) : f }));
+  return [val, set];
+};
+
+const mondayKey = (off = 0) => { const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - ((d.getDay() + 6) % 7) + off * 7); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+const monthKey = (off = 0) => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + off); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`; };
+const dateFrom = (k) => new Date(k + 'T12:00:00');
+const validDate = (k) => /^\d{4}-\d{2}-\d{2}$/.test(k) && keyOf(dateFrom(k).getTime()) === k;
+const daysUntil = (k) => daysBetween(dayKey(0), k);
+const num = (x, d = 0) => { const v = parseFloat(String(x == null ? '' : x).replace(',', '.')); return Number.isFinite(v) ? v : d; };
+const r1 = (x) => Math.round(x * 10) / 10;
+const commas = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const money = (v, cur = '$') => { const a = Math.abs(v), t = a < 100 && a % 1 ? a.toFixed(2) : commas(Math.round(a)); return `${v < 0 ? '-' : ''}${cur}${t}`; };
+const ri = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+const dayOfYear = () => { const d = new Date(), s = new Date(d.getFullYear(), 0, 0); return Math.floor((d - s) / 864e5); };
+const pruneDays = (o, keep = 60) => Object.fromEntries(Object.entries(o || {}).sort(([a], [b]) => b.localeCompare(a)).slice(0, keep));
+
+/* Fitness and money maths */
+const e1rm = (w, r) => (r <= 1 ? w : w * (1 + r / 30));
+const tdee = (sex, age, h, w, act) => Math.round((10 * w + 6.25 * h - 5 * age + (sex === 'm' ? 5 : -161)) * act);
+const futureValue = (p, c, rate, years) => {
+  const n = Math.round(years * 12), i = rate / 100 / 12;
+  if (!n) return p;
+  if (!i) return p + c * n;
+  const g = Math.pow(1 + i, n);
+  return p * g + c * ((g - 1) / i);
+};
+const yearsToTarget = (target, p, c, rate) => {
+  const i = rate / 100 / 12;
+  let bal = p;
+  for (let m = 0; m <= 1200; m++) { if (bal >= target) return m / 12; bal = bal * (1 + i) + c; }
+  return null;
+};
+const spentIn = (exp, mk) => sum(exp.filter((e) => keyOf(e.ts).slice(0, 7) === mk).map((e) => e.amt));
+const daysLeftMonth = () => { const d = new Date(); return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate() - d.getDate() + 1; };
+const subMonthly = (x) => (x.cycle === 'year' ? x.amt / 12 : x.amt);
+const nextDay = (dom) => {
+  const now = new Date(), dim = (y, m) => new Date(y, m + 1, 0).getDate();
+  let y = now.getFullYear(), m = now.getMonth(), t = new Date(y, m, Math.min(dom, dim(y, m)), 12);
+  if (keyOf(t.getTime()) < dayKey(0)) { m += 1; if (m > 11) { m = 0; y += 1; } t = new Date(y, m, Math.min(dom, dim(y, m)), 12); }
+  return daysBetween(dayKey(0), keyOf(t.getTime()));
+};
+
+/* Thinking and relationships */
+const calib = (ds) => {
+  const res = ds.filter((d) => d.outcome);
+  if (!res.length) return null;
+  const hit = res.filter((d) => d.outcome === 'right').length + 0.5 * res.filter((d) => d.outcome === 'mixed').length;
+  const rate = (100 * hit) / res.length, conf = sum(res.map((d) => d.conf)) / res.length;
+  return { n: res.length, rate: Math.round(rate), conf: Math.round(conf), gap: Math.round(conf - rate) };
+};
+const dueIn = (p) => (p.last ? p.cadence - daysBetween(p.last, dayKey(0)) : 0);
+const normMD = (x) => { const m = /^(\d{1,2})[-/](\d{1,2})$/.exec(String(x).trim()); if (!m) return ''; const mo = +m[1], d = +m[2]; return mo >= 1 && mo <= 12 && d >= 1 && d <= 31 ? `${pad(mo)}-${pad(d)}` : ''; };
+const bdayIn = (md) => {
+  const m = /^(\d{2})-(\d{2})$/.exec(md || '');
+  if (!m) return null;
+  const y = new Date().getFullYear();
+  let n = new Date(y, +m[1] - 1, +m[2], 12);
+  if (keyOf(n.getTime()) < dayKey(0)) n = new Date(y + 1, +m[1] - 1, +m[2], 12);
+  return daysBetween(dayKey(0), keyOf(n.getTime()));
+};
+const lifeStats = (birth, exp) => {
+  const days = Math.floor((Date.now() - dateFrom(birth).getTime()) / 864e5), weeks = Math.max(0, Math.floor(days / 7)), total = exp * 52;
+  return { days, weeks, total, left: Math.max(0, total - weeks), pct: Math.round(1000 * clamp(weeks / total)) / 10, years: Math.max(0, Math.min(exp, days / 365.25)) };
+};
+const skillMins = (sk) => sum(Object.values(sk.log || {}));
+
+/* Energy map */
+const energyByHour = (log) => { const by = {}; log.forEach((e) => { const h = new Date(e.ts).getHours(); (by[h] = by[h] || []).push(e.v); }); const out = {}; Object.keys(by).forEach((h) => { out[h] = sum(by[h]) / by[h].length; }); return out; };
+const bestEnergy = (log) => {
+  if (log.length < 10) return null;
+  const av = energyByHour(log);
+  let best = null;
+  for (let h = 5; h <= 21; h++) {
+    if (av[h] === undefined || av[h + 1] === undefined) continue;
+    const sc = (av[h] + av[h + 1]) / 2;
+    if (!best || sc > best.score + 1e-9) best = { start: h, end: h + 2, score: r1(sc) };
+  }
+  return best;
+};
+
+/* Breathwork and games */
+const BREATH = {
+  box: { name: 'Box 4-4-4-4', note: 'Steadies the nervous system before hard work.', ph: [['Inhale', 4, 1], ['Hold', 4, 1], ['Exhale', 4, 0], ['Hold', 4, 0]] },
+  calm: { name: '4-7-8 calm', note: 'A long exhale to wind down or fall asleep.', ph: [['Inhale', 4, 1], ['Hold', 7, 1], ['Exhale', 8, 0]] },
+  sigh: { name: 'Physiological sigh', note: 'Two sips in, one long breath out. Fast stress relief.', ph: [['Inhale', 2, 1], ['Sip in', 1, 1], ['Long exhale', 6, 0]] },
+  even: { name: 'Coherent 5-5', note: 'Smooth, even breathing for steady focus.', ph: [['Inhale', 5, 1], ['Exhale', 5, 0]] },
+};
+const breathAt = (ph, ms) => {
+  const L = sum(ph.map((p) => p[1])) * 1000, pos = ms % L;
+  let acc = 0;
+  for (let i = 0; i < ph.length; i++) {
+    const d = ph[i][1] * 1000;
+    if (pos < acc + d) { const prev = ph[(i - 1 + ph.length) % ph.length][2]; return { i, label: ph[i][0], left: Math.ceil((acc + d - pos) / 1000), fill: prev + (ph[i][2] - prev) * ((pos - acc) / d) }; }
+    acc += d;
+  }
+  return { i: 0, label: ph[0][0], left: ph[0][1], fill: 0 };
+};
+const mathQ = (lvl) => {
+  let a, b, op;
+  const swap = () => { if (b > a) { const t = a; a = b; b = t; } };
+  if (lvl <= 0) { a = ri(2, 20); b = ri(2, 20); op = Math.random() < 0.5 ? '+' : '-'; if (op === '-') swap(); }
+  else if (lvl === 1) { a = ri(12, 99); b = ri(12, 99); op = Math.random() < 0.5 ? '+' : '-'; if (op === '-') swap(); }
+  else if (lvl === 2) { a = ri(2, 12); b = ri(2, 12); op = '\u00D7'; }
+  else if (lvl === 3) { if (Math.random() < 0.5) { a = ri(11, 49); b = ri(3, 9); op = '\u00D7'; } else { b = ri(3, 12); a = b * ri(3, 15); op = '\u00F7'; } }
+  else if (Math.random() < 0.35) { a = ri(12, 29); b = ri(6, 19); op = '\u00D7'; }
+  else { a = ri(101, 499); b = ri(11, 99); op = Math.random() < 0.5 ? '+' : '-'; if (op === '-') swap(); }
+  const ans = op === '+' ? a + b : op === '-' ? a - b : op === '\u00D7' ? a * b : a / b;
+  return { text: `${a} ${op} ${b}`, ans };
+};
+const STROOP = [['RED', '#F87171'], ['BLUE', '#60A5FA'], ['GREEN', '#4ADE80'], ['YELLOW', '#FBBF24']];
+const stroopQ = () => { const w = ri(0, 3); let c = ri(0, 3); if (c === w && Math.random() < 0.75) c = (c + ri(1, 3)) % 4; return { word: STROOP[w][0], ink: c }; };
+const wordDelay = (chunk, wpm) => ((60000 / wpm) * chunk.split(' ').length) * (/[.!?]["')\]]?$/.test(chunk) ? 1.8 : /[,;:]$/.test(chunk) ? 1.3 : 1);
+const SAMPLE_TEXT = 'Reading speed is mostly a habit, not a limit. Most people read at the pace they learned as children, silently pronouncing every word. Your eyes can take in far more than your inner voice can say. Training yourself to see words in short groups, and to stop rereading, can raise your pace without hurting understanding. Start at a speed that feels slightly too fast, keep your attention on the meaning, and increase the pace a little each week. Afterwards, summarize what you read in one sentence. If you cannot, slow down for the next session.';
+
+/* Leverage insights: which behaviours go with your best days */
+const leverInsights = (meta, activity, habits) => {
+  const first = Object.keys(activity).sort()[0];
+  if (!first) return { rows: [], days: 0 };
+  const days = lastDays(60).filter((d) => d >= first);
+  const tg = meta.sleepTarget || 8, wg = meta.waterGoal || 8, rt = meta.routines || {}, nut = meta.nut || {};
+  const wk = new Set((meta.workouts || []).map((w) => keyOf(w.ts))), jr = new Set((meta.journal || []).map((j) => j.date));
+  const food = {};
+  (meta.food || []).forEach((f) => { const k = keyOf(f.ts); food[k] = (food[k] || 0) + (f.p || 0); });
+  const stepsDone = (d, kind) => { const steps = (rt[kind] || DEFAULT_ROUTINES[kind]), done = (((rt.done || {})[d] || {})[kind]) || []; return steps.length > 0 && steps.every((x) => done.includes(x.id)); };
+  const F = [
+    { id: 'sleep', label: `Sleeping ${tg}h or more`, has: (d) => ((meta.sleep || {})[d] || 0) >= tg, habit: `Sleep ${tg}+ hours`, cat: 'body' },
+    { id: 'water', label: 'Hitting your water goal', has: (d) => ((meta.water || {})[d] || 0) >= wg, habit: 'Hit my water goal', cat: 'body' },
+    { id: 'workout', label: 'Training', has: (d) => wk.has(d), habit: 'Train', cat: 'body' },
+    { id: 'calm', label: '5+ minutes of calm practice', has: (d) => ((meta.calm || {})[d] || 0) >= 5, habit: 'Breathe or meditate 5 minutes', cat: 'mind' },
+    { id: 'journal', label: 'Journaling', has: (d) => jr.has(d), habit: 'Journal', cat: 'mind' },
+    { id: 'plan', label: 'Having a plan', has: (d) => !!(meta.plans || {})[d], habit: 'Plan my day', cat: 'discipline' },
+    { id: 'focus', label: '25+ minutes of deep focus', has: (d) => ((meta.focusDays || {})[d] || 0) >= 25, habit: 'Do a deep focus session', cat: 'career' },
+    { id: 'morning', label: 'Finishing your morning routine', has: (d) => stepsDone(d, 'morning'), habit: 'Complete my morning routine', cat: 'discipline' },
+    { id: 'protein', label: 'Hitting your protein target', has: (d) => !!nut.p && (food[d] || 0) >= nut.p, habit: 'Hit my protein target', cat: 'body' },
+  ];
+  const avg = (a) => sum(a.map((d) => activity[d] || 0)) / a.length;
+  const rows = F.map((f) => {
+    const w = days.filter(f.has), wo = days.filter((d) => !f.has(d));
+    if (w.length < 3 || wo.length < 3) return null;
+    return { id: f.id, label: f.label, habit: f.habit, cat: f.cat, delta: r1(avg(w) - avg(wo)), nWith: w.length, nWithout: wo.length, withAvg: r1(avg(w)), withoutAvg: r1(avg(wo)) };
+  }).filter(Boolean).sort((a, b) => b.delta - a.delta);
+  return { rows, days: days.length };
+};
+
+/* Offline auto-planner: builds a realistic time-blocked day from your own data, no AI needed */
+function autoPlan({ nowH, off, wake, bed, pk, tasks, habits, due }) {
+  const start = off ? wake : Math.max(nowH, wake);
+  const bedH = bed < wake ? bed + 24 : bed, wd = Math.min(bedH - 1, 23), limit = wd;
+  if (start >= limit - 0.5) return null;
+  const today = dayKey(0), B = [];
+  const place = (s, e, title, cat, ref) => {
+    s = Math.max(s, start); e = Math.min(e, limit);
+    if (e - s < 0.25 || B.some((b) => s < b.end && e > b.start)) return false;
+    B.push({ start: s, end: e, title, cat, ref: ref || '' });
+    return true;
+  };
+  const open = tasks.filter((t) => !t.done).sort((a, b) => (b.star ? 1 : 0) - (a.star ? 1 : 0));
+  const top = open[0], second = open[1];
+  B.push({ start: wd, end: Math.min(wd + 0.75, 24), title: 'Wind down and prepare for sleep', cat: 'mind', ref: '' });
+  const deep = top ? `Deep work: ${top.title}` : 'Deep work: your most important output';
+  if (!place(pk.start, Math.min(pk.end, pk.start + 2), deep, top ? top.cat : 'career', top && top.title)) place(start + 0.25, start + 2.25, deep, top ? top.cat : 'career', top && top.title);
+  place(12.5, 13, 'Lunch and a short walk', 'body');
+  place(18.5, 19.25, 'Dinner', 'body');
+  if (off || start <= wake + 0.5) place(wake, wake + 0.5, 'Morning routine and water', 'mind');
+  const bodyHabit = habits.find((h) => h.cat === 'body' && (off || !h.log.includes(today)));
+  const trainTitle = bodyHabit ? bodyHabit.title : 'Move: 30 minutes of training or a brisk walk';
+  const ts = Math.max(start, wake + 0.5);
+  if (!(pk.start - ts >= 0.75 && place(ts, ts + 0.75, trainTitle, 'body', bodyHabit && bodyHabit.title))) place(17, 17.75, trainTitle, 'body', bodyHabit && bodyHabit.title);
+  if (second) place(14, 15.5, `Focus: ${second.title}`, second.cat, second.title);
+  if (due > 0) place(15.75, 16.15, `Flashcard review (${due} due)`, 'academics');
+  const rest = open.length - (top ? 1 : 0) - (second ? 1 : 0);
+  if (rest > 0) place(16.25, 17, `Clear small tasks (${rest})`, 'discipline');
+  habits.filter((h) => h !== bodyHabit && (off || !h.log.includes(today))).slice(0, 3).forEach((h) => {
+    for (let t = 19.25; t < limit - 0.25; t += 0.25) if (place(t, t + 0.25, h.title, h.cat, h.title)) break;
+  });
+  B.sort((a, b) => a.start - b.start);
+  return B.length >= 2 ? normPlan(B, [], top ? top.title : '') : null;
+}
+
+const DEFAULT_ROUTINES = {
+  morning: [{ id: 'm1', text: 'Drink a glass of water' }, { id: 'm2', text: '10 minutes of daylight or movement' }, { id: 'm3', text: 'Review your plan and pick the one thing' }, { id: 'm4', text: 'Keep your phone away until the first focus block' }],
+  evening: [{ id: 'e1', text: 'Write tomorrow\'s top tasks' }, { id: 'e2', text: 'Tidy your space and prep for tomorrow' }, { id: 'e3', text: 'Screens off 30 minutes before bed' }, { id: 'e4', text: 'Read 10 pages' }],
+};
+
+const MODELS = [
+  { id: 'first', name: 'First principles', tip: 'Break a problem into basic truths and rebuild from there instead of copying what others do.', ask: 'What do I know for certain, and what am I only assuming?' },
+  { id: 'inversion', name: 'Inversion', tip: 'Ask how to guarantee failure, then avoid exactly that.', ask: 'What would make this fail for sure?' },
+  { id: 'second', name: 'Second-order thinking', tip: 'Consider the consequences of the consequences, not just the first result.', ask: 'And then what? And then what?' },
+  { id: 'pareto', name: 'Pareto principle', tip: 'A small share of inputs creates most of the results.', ask: 'Which 20% of my actions drive 80% of my results?' },
+  { id: 'opp', name: 'Opportunity cost', tip: 'Every yes is a no to something else.', ask: 'What am I giving up by choosing this?' },
+  { id: 'circle', name: 'Circle of competence', tip: 'Know the edge of what you truly understand and respect it.', ask: 'Do I really know this, or do I just recognize it?' },
+  { id: 'compound', name: 'Compounding', tip: 'Small gains repeated daily beat big efforts made once.', ask: 'What tiny daily action would be huge in a year?' },
+  { id: 'margin', name: 'Margin of safety', tip: 'Build a buffer for what you cannot predict.', ask: 'If I am wrong by 30%, do I still survive?' },
+  { id: 'occam', name: "Occam's razor", tip: 'Prefer the simplest explanation that fits the facts.', ask: 'What is the simplest explanation?' },
+  { id: 'hanlon', name: "Hanlon's razor", tip: 'Do not assume malice when neglect or error explains it.', ask: 'What is the most charitable explanation?' },
+  { id: 'map', name: 'Map is not the territory', tip: 'Your model of reality is not reality. Update it.', ask: 'Where might my picture be out of date?' },
+  { id: 'negativa', name: 'Via negativa', tip: 'Improve by removing, not by adding.', ask: 'What could I stop doing that would make things better?' },
+  { id: 'bayes', name: 'Bayesian updating', tip: 'Change your beliefs in proportion to the strength of new evidence.', ask: 'What would change my mind, and by how much?' },
+  { id: 'anti', name: 'Antifragility', tip: 'Seek systems that gain from stress and volatility.', ask: 'How can this setback make me stronger?' },
+  { id: 'lindy', name: 'Lindy effect', tip: 'The longer something has lasted, the longer it will likely last.', ask: 'Is this a fad or has it survived for decades?' },
+  { id: 'sunk', name: 'Sunk cost', tip: 'Past investment is gone. Decide based on the future.', ask: 'If I were starting fresh today, would I choose this?' },
+  { id: 'regret', name: 'Regret minimization', tip: 'Choose what your 80-year-old self would approve of.', ask: 'Which choice will I regret least?' },
+  { id: 'eisen', name: 'Eisenhower matrix', tip: 'Important is rarely urgent, and urgent is rarely important.', ask: 'Is this important, urgent, both or neither?' },
+  { id: 'feynman', name: 'Feynman technique', tip: 'If you cannot explain it simply, you do not understand it yet.', ask: 'Can I explain this to a 12-year-old?' },
+  { id: 'leverage', name: 'Leverage', tip: 'Use systems, tools and other people to multiply output.', ask: 'What can I automate, delegate or template?' },
+  { id: 'parkinson', name: "Parkinson's law", tip: 'Work expands to fill the time you give it.', ask: 'What shorter deadline would force focus?' },
+  { id: 'premortem', name: 'Pre-mortem', tip: 'Imagine the project already failed and work out why.', ask: 'It is a year from now and this failed. Why?' },
+  { id: 'twomin', name: 'Two-minute rule', tip: 'If it takes under two minutes, do it now.', ask: 'Can I finish this in two minutes?' },
+  { id: 'goodhart', name: "Goodhart's law", tip: 'When a measure becomes a target, it stops being a good measure.', ask: 'Am I optimizing the metric or the real goal?' },
+];
+
+const PLAYBOOKS = [
+  { g: 'Think better', t: 'First-principles teardown', p: 'Run a first-principles teardown on this problem. Separate facts from assumptions, then rebuild the best solution from the facts: ' },
+  { g: 'Think better', t: 'Inversion and pre-mortem', p: 'Use inversion and a pre-mortem on this plan. List how it fails, rank by likelihood and damage, and give me prevention steps: ' },
+  { g: 'Think better', t: 'Steelman the other side', p: 'Steelman the strongest opposing view to my position, then tell me what I might be missing: ' },
+  { g: 'Think better', t: 'Second-order effects', p: 'Map the first, second and third-order consequences of this decision: ' },
+  { g: 'Learn faster', t: '20-hour skill roadmap', p: 'Design a 20-hour roadmap to get functionally good at this skill: deconstruct it, name what to learn first, and give me a practice schedule that fits my week: ' },
+  { g: 'Learn faster', t: 'Feynman teach-back', p: 'Quiz me with the Feynman technique. Ask me to explain this topic simply, find the gaps in my explanation, and make me fix them: ' },
+  { g: 'Learn faster', t: 'Exam sprint plan', p: 'Build a spaced-repetition exam sprint plan for me. Subject and exam date: ' },
+  { g: 'Learn faster', t: 'Book to action plan', p: 'Turn this book into a one-page action plan: the 5 key ideas, how each applies to my life, and what to do this week: ' },
+  { g: 'Performance', t: 'Diagnose my procrastination', auto: true, p: 'Diagnose my procrastination using my real data (tasks, habits, focus, sleep, energy). Name the most likely root cause and give me three small experiments for this week.' },
+  { g: 'Performance', t: 'Design a keystone habit', p: 'Design a keystone habit for me with a clear cue, a 2-minute version and a reward. The goal I want it to serve: ' },
+  { g: 'Performance', t: 'Energy audit', auto: true, p: 'Run an energy audit from my sleep, energy log, workouts and routine. Where am I leaking energy, and what are the three highest-leverage changes?' },
+  { g: 'Performance', t: 'Burnout check', auto: true, p: 'Check me for burnout risk from my recent workload, sleep debt, breaks and mood. Be honest, and give me a recovery plan if needed.' },
+  { g: 'Life design', t: 'Quarterly reset', auto: true, p: 'Run a quarterly life reset with me: review my goals, life wheel, habits and finances, name what to stop, start and continue, and set 3 outcomes for the next 90 days.' },
+  { g: 'Life design', t: 'Weekly OKRs', auto: true, p: 'Write my weekly OKRs: 3 objectives with measurable key results, based on my goals, projects and open tasks.' },
+  { g: 'Life design', t: 'Hard conversation script', p: 'Help me prepare for a hard conversation. Give me an opening line, key points, likely reactions and how to respond. The situation: ' },
+  { g: 'Career and money', t: 'Interview prep', p: 'Prepare me for this interview with likely questions, strong answer structures and smart questions to ask. Role and company: ' },
+  { g: 'Career and money', t: 'Negotiation prep', p: 'Prepare my negotiation: my best alternative, their likely interests, an opening offer and the lines to use. The situation: ' },
+  { g: 'Career and money', t: 'Money leak finder', auto: true, p: 'Review my expenses, subscriptions and budget. Find the biggest leaks, what to cut, and a simple plan to save more each month.' },
+  { g: 'Body', t: 'Training plan from my data', auto: true, p: 'Design my next 4 weeks of training from my workout log, recovery and goals. Keep it realistic for my schedule.' },
+  { g: 'Body', t: 'Meal plan for my targets', auto: true, p: 'Build a simple 3-day meal plan that hits my calorie and protein targets. Keep it cheap and quick to cook.' },
+  { g: 'Relationships', t: 'Reach-out messages', auto: true, p: 'Draft short, warm messages to the people on my overdue list so I can reconnect today.' },
+];
+
+const REG = [
+  { id: 'sleep', g: 'Body', icon: 'moon-outline', name: 'Sleep', desc: 'Timer, sleep debt and bedtime coaching' },
+  { id: 'workout', g: 'Body', icon: 'barbell-outline', name: 'Workouts', desc: 'Sets, reps and PR tracking' },
+  { id: 'nutrition', g: 'Body', icon: 'nutrition-outline', name: 'Nutrition', desc: 'Calories, protein and a target calculator' },
+  { id: 'body', g: 'Body', icon: 'body-outline', name: 'Body metrics', desc: 'Weight and waist trends' },
+  { id: 'fasting', g: 'Body', icon: 'hourglass-outline', name: 'Fasting', desc: 'Fasting timer and history' },
+  { id: 'breathe', g: 'Body', icon: 'leaf-outline', name: 'Breathwork', desc: 'Guided patterns to calm or focus' },
+  { id: 'meditate', g: 'Body', icon: 'flower-outline', name: 'Meditation', desc: 'Silent timer with a streak' },
+  { id: 'math', g: 'Brain', icon: 'calculator-outline', name: 'Math sprint', desc: '60-second mental arithmetic' },
+  { id: 'stroop', g: 'Brain', icon: 'color-palette-outline', name: 'Stroop drill', desc: 'Train attention control' },
+  { id: 'speed', g: 'Brain', icon: 'eye-outline', name: 'Speed reader', desc: 'Read faster, one chunk at a time' },
+  { id: 'books', g: 'Brain', icon: 'library-outline', name: 'Reading list', desc: 'Progress, pace and takeaways' },
+  { id: 'notes', g: 'Brain', icon: 'bulb-outline', name: 'Second brain', desc: 'Searchable notes and ideas' },
+  { id: 'models', g: 'Brain', icon: 'construct-outline', name: 'Mental models', desc: 'A new thinking tool every day' },
+  { id: 'decisions', g: 'Brain', icon: 'scale-outline', name: 'Decision journal', desc: 'Calibrate your judgment' },
+  { id: 'decide', g: 'Brain', icon: 'options-outline', name: 'Decision matrix', desc: 'Weighted scoring of your options' },
+  { id: 'premortem', g: 'Brain', icon: 'warning-outline', name: 'Pre-mortem', desc: 'Find failure before it happens' },
+  { id: 'priority', g: 'Execute', icon: 'grid-outline', name: 'Priority matrix', desc: 'Urgent versus important' },
+  { id: 'big3', g: 'Execute', icon: 'podium-outline', name: 'Weekly Big 3', desc: 'Three outcomes that make the week' },
+  { id: 'projects', g: 'Execute', icon: 'folder-open-outline', name: 'Projects', desc: 'Next actions and stall alerts' },
+  { id: 'routines', g: 'Execute', icon: 'sunny-outline', name: 'Routines', desc: 'Morning and evening checklists' },
+  { id: 'timetrack', g: 'Execute', icon: 'stopwatch-outline', name: 'Time tracker', desc: 'See where your hours really go' },
+  { id: 'energy', g: 'Execute', icon: 'battery-charging-outline', name: 'Energy map', desc: 'Find your real peak hours' },
+  { id: 'shutdown', g: 'Execute', icon: 'power-outline', name: 'Evening shutdown', desc: 'Set tomorrow up tonight' },
+  { id: 'anti', g: 'Execute', icon: 'ban-outline', name: 'Break bad habits', desc: 'Track what you refuse to do' },
+  { id: 'countdowns', g: 'Execute', icon: 'alarm-outline', name: 'Countdowns', desc: 'Deadlines and events' },
+  { id: 'goals', g: 'Execute', icon: 'trophy-outline', name: 'Goals', desc: 'Big targets with progress' },
+  { id: 'briefing', g: 'Intelligence', icon: 'newspaper-outline', name: 'Daily briefing', desc: 'Everything that matters today' },
+  { id: 'levers', g: 'Intelligence', icon: 'analytics-outline', name: 'Leverage insights', desc: 'What drives your best days' },
+  { id: 'playbooks', g: 'Intelligence', icon: 'sparkles-outline', name: 'Coach playbooks', desc: 'Expert prompts in one tap' },
+  { id: 'search', g: 'Intelligence', icon: 'search-outline', name: 'Search everything', desc: 'Find any task, note or entry' },
+  { id: 'review', g: 'Intelligence', icon: 'document-text-outline', name: 'Weekly review', desc: 'Your week in numbers' },
+  { id: 'retro', g: 'Intelligence', icon: 'refresh-circle-outline', name: 'Weekly retro', desc: 'What worked, what to change' },
+  { id: 'expenses', g: 'Money', icon: 'cash-outline', name: 'Expenses', desc: 'Spending, budget and daily allowance' },
+  { id: 'subs', g: 'Money', icon: 'card-outline', name: 'Subscriptions', desc: 'What you pay every month and year' },
+  { id: 'networth', g: 'Money', icon: 'trending-up-outline', name: 'Net worth', desc: 'Assets, debts and monthly trend' },
+  { id: 'calc', g: 'Money', icon: 'calculator-outline', name: 'Wealth calculators', desc: 'Compounding, FI number, time is money' },
+  { id: 'skills', g: 'Growth', icon: 'school-outline', name: 'Skill tracker', desc: 'Deliberate practice hours' },
+  { id: 'people', g: 'Growth', icon: 'people-outline', name: 'People', desc: 'Relationship reminders and birthdays' },
+  { id: 'principles', g: 'Growth', icon: 'compass-outline', name: 'Principles', desc: 'Your rules and identity' },
+  { id: 'journal', g: 'Growth', icon: 'book-outline', name: 'Journal', desc: 'Daily prompts and streak' },
+  { id: 'wins', g: 'Growth', icon: 'medal-outline', name: 'Wins vault', desc: 'Proof you can do hard things' },
+  { id: 'wheel', g: 'Growth', icon: 'aperture-outline', name: 'Life wheel', desc: 'Rate 8 areas of life' },
+  { id: 'lifeweeks', g: 'Growth', icon: 'time-outline', name: 'Life in weeks', desc: 'Your time, made visible' },
+  { id: 'bucket', g: 'Growth', icon: 'checkbox-outline', name: 'Bucket list', desc: 'Things you will not skip' },
+  { id: 'badges', g: 'Growth', icon: 'ribbon-outline', name: 'Badges', desc: 'Unlocked from real activity' },
+];
+const HUB_GROUPS = ['Body', 'Brain', 'Execute', 'Intelligence', 'Money', 'Growth'];
+const regOf = (id) => REG.find((r) => r.id === id);
+const SHORT = { workout: 'Workouts', body: 'Body', fasting: 'Fasting', breathe: 'Breathe', meditate: 'Meditate', math: 'Math', stroop: 'Stroop', speed: 'Speed read', decisions: 'Decisions', decide: 'Matrix', priority: 'Priorities', big3: 'Big 3', timetrack: 'Time', shutdown: 'Shutdown', anti: 'Bad habits', briefing: 'Briefing', levers: 'Levers', search: 'Search', review: 'Review', retro: 'Retro', networth: 'Net worth', calc: 'Calculators', lifeweeks: 'Life weeks', wheel: 'Life wheel' };
+const shortOf = (r) => SHORT[r.id] || r.name;
+
+/* ---------- Small UI kit for the new screens ---------- */
+function Inp({ value, onChange, ph, num: isNum, multi, onSubmit, style, editable }) {
+  return (
+    <TextInput
+      style={[s.addInput, { flex: 0, marginBottom: 8 }, multi && { minHeight: 90, textAlignVertical: 'top' }, style]}
+      value={value} onChangeText={onChange} placeholder={ph} placeholderTextColor={C.muted} keyboardAppearance="dark"
+      keyboardType={isNum ? 'decimal-pad' : 'default'} multiline={!!multi} onSubmitEditing={onSubmit} editable={editable !== false}
+    />
+  );
+}
+function Btn({ label, onPress, kind, disabled, icon, style }) {
+  const primary = kind !== 'ghost' && kind !== 'danger';
+  const bg = disabled ? C.disabled : kind === 'danger' ? '#B91C1C' : primary ? C.accent : '#17171A';
+  const fg = disabled ? '#6B6B73' : primary ? C.onAccent : kind === 'danger' ? '#fff' : C.text;
+  return (
+    <Pressable disabled={disabled} onPress={onPress} style={[s.wide, { backgroundColor: bg, marginTop: 8 }, style]}>
+      <View style={s.btnRow}>{!!icon && <Icon n={icon} size={18} color={fg} style={{ marginRight: 8 }} />}<Text style={[s.addBtnText, { color: fg }]}>{label}</Text></View>
+    </Pressable>
+  );
+}
+function Chips({ opts, value, onChange, show }) {
+  return (
+    <View style={s.chipRow}>
+      {opts.map((o) => (
+        <Pressable key={String(o)} onPress={() => onChange(o)} style={[s.chip, { paddingVertical: 6 }, value === o && { borderColor: C.accent, backgroundColor: C.raised }]}>
+          <Text style={s.chipText}>{show ? show(o) : String(o)}</Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+const Bar = ({ pct, color = C.accent }) => <View style={s.track}><View style={[s.fill, { width: `${Math.max(0, Math.min(100, pct))}%`, backgroundColor: color }]} /></View>;
+function Row({ title, sub, right, onDelete, onPress, check, done, accent }) {
+  return (
+    <Pressable onPress={onPress} disabled={!onPress} style={s.item}>
+      {check !== undefined && <View style={[s.check, { borderColor: accent || C.muted }, done && { backgroundColor: accent || C.online }]}>{done && <Icon n="checkmark" size={16} color="#000" />}</View>}
+      <View style={{ flex: 1 }}>
+        <Text style={[s.itemText, { flex: 0 }, done && s.done]}>{title}</Text>
+        {!!sub && <Text style={s.muted}>{sub}</Text>}
+      </View>
+      {right ? <View style={{ marginLeft: 8 }}>{right}</View> : null}
+      {!!onDelete && <Pressable onPress={onDelete} hitSlop={10}><Icon n="close" size={18} color={C.muted} style={{ marginLeft: 10 }} /></Pressable>}
+    </Pressable>
+  );
+}
+const Label = ({ children, style }) => <Text style={[s.muted, { marginTop: 10, marginBottom: 4 }, style]}>{children}</Text>;
 
 const buildSystem = (mode, tasks, habits, profile = {}, memory = [], ctx = {}) => {
   const c = mode === 'all' ? null : catOf(mode);
@@ -466,10 +834,11 @@ function Confirm({ c, onNo }) {
 }
 
 function Screen({ title, sub, onBack, children }) {
+  const A = useApp();
   return (
     <ScrollView contentContainerStyle={s.page} keyboardShouldPersistTaps="handled">
-      <Pressable onPress={onBack} hitSlop={10} style={[s.btnRow, { alignSelf: 'flex-start', marginBottom: 8 }]}>
-        <Icon n="chevron-back" size={18} color={C.muted} /><Text style={[s.muted, { marginLeft: 2 }]}>Today</Text>
+      <Pressable onPress={onBack || (() => A.go(A.backTo || 'today'))} hitSlop={10} style={[s.btnRow, { alignSelf: 'flex-start', marginBottom: 8 }]}>
+        <Icon n="chevron-back" size={18} color={C.muted} /><Text style={[s.muted, { marginLeft: 2 }]}>{A.backTo === 'hub' ? 'Hub' : 'Today'}</Text>
       </Pressable>
       <Text style={s.h1}>{title}</Text>
       {!!sub && <Text style={[s.muted, { marginTop: 4, marginBottom: 12 }]}>{sub}</Text>}
@@ -639,7 +1008,7 @@ function Goals({ meta, setMeta, onXp, onBack }) {
   };
   return (
     <Screen title="Goals" sub="Big targets with a number. Finishing one earns 25 XP and Coach knows about every open goal." onBack={onBack}>
-      <TextInput style={[s.addInput, { marginBottom: 8 }]} value={title} onChangeText={setTitle} placeholder="Goal (e.g. Read 12 books)" placeholderTextColor={C.muted} keyboardAppearance="dark" />
+      <TextInput style={[s.addInput, { flex: 0, marginBottom: 8 }]} value={title} onChangeText={setTitle} placeholder="Goal (e.g. Read 12 books)" placeholderTextColor={C.muted} keyboardAppearance="dark" />
       <View style={s.addRow}>
         <TextInput style={s.addInput} value={target} onChangeText={setTarget} keyboardType="number-pad" placeholder="Target number" placeholderTextColor={C.muted} keyboardAppearance="dark" onSubmitEditing={add} />
         <Pressable onPress={add} style={[s.addBtn, !title.trim() && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Add</Text></Pressable>
@@ -684,7 +1053,7 @@ function Journal({ meta, setMeta, onSave, onBack }) {
         <Text style={s.muted}>Today's prompt</Text>
         <Text style={[s.bigQ, { fontSize: 19, lineHeight: 25, marginTop: 6 }]}>{prompt}</Text>
       </View>
-      <TextInput style={[s.addInput, { minHeight: 130, textAlignVertical: 'top' }]} value={text} onChangeText={setText} multiline placeholder="Write freely. This stays on your device." placeholderTextColor={C.muted} keyboardAppearance="dark" />
+      <TextInput style={[s.addInput, { flex: 0, minHeight: 130, textAlignVertical: 'top' }]} value={text} onChangeText={setText} multiline placeholder="Write freely. This stays on your device." placeholderTextColor={C.muted} keyboardAppearance="dark" />
       <Pressable onPress={save} style={[s.wide, { backgroundColor: text.trim() ? C.accent : C.disabled, maxWidth: '100%', marginTop: 10 }]}><Text style={s.addBtnText}>Save entry</Text></Pressable>
       <Text style={s.section}>Past entries</Text>
       {list.length === 0 && <Text style={s.empty}>Nothing written yet.</Text>}
@@ -775,6 +1144,1584 @@ function Review({ habits, activity, meta, online, onBack, onAnalyze }) {
   );
 }
 
+
+/* ---------- Body: workouts, nutrition, metrics, fasting, calm ---------- */
+function UnitChips() {
+  const { meta, setMeta } = useApp();
+  return <Chips opts={['kg', 'lb']} value={meta.unit || 'kg'} onChange={(u) => setMeta((m) => ({ ...m, unit: u }))} />;
+}
+
+function Workout() {
+  const A = useApp();
+  const [sets, setSets] = useMeta('workouts', []);
+  const unit = A.meta.unit || 'kg';
+  const [ex, setEx] = useState(''), [w, setW] = useState('60'), [r, setR] = useState('8');
+  const today = dayKey(0);
+  const todays = sets.filter((x) => keyOf(x.ts) === today);
+  const names = [...new Set(sets.map((x) => x.ex))].slice(0, 8);
+  const best = (name) => Math.max(0, ...sets.filter((x) => x.ex === name).map((x) => e1rm(x.w, x.r)));
+  const pick = (name) => { setEx(name); const l = sets.find((x) => x.ex === name); if (l) { setW(String(l.w)); setR(String(l.r)); } };
+  const add = () => {
+    const name = ex.trim(), wt = num(w), rp = Math.round(num(r));
+    if (!name || rp < 1 || wt < 0) return;
+    const prior = best(name), now = e1rm(wt, rp);
+    setSets((l) => [{ id: uid(), ts: Date.now(), ex: name, w: wt, r: rp }, ...l].slice(0, 2000));
+    A.award('workout', 8);
+    if (prior > 0 && now > prior + 0.01) A.toast(`New PR on ${name}: about ${r1(now)} ${unit} estimated 1RM`);
+  };
+  const groups = {};
+  todays.slice().reverse().forEach((x) => { (groups[x.ex] = groups[x.ex] || []).push(x); });
+  const vol = sum(todays.map((x) => x.w * x.r));
+  const prs = [...new Set(sets.map((x) => x.ex))].map((n) => ({ n, v: best(n) })).sort((a, b) => b.v - a.v).slice(0, 6);
+  const week = lastDays(7).slice().reverse().map((d) => ({ d, v: sum(sets.filter((x) => keyOf(x.ts) === d).map((x) => x.w * x.r)) }));
+  const mx = Math.max(1, ...week.map((x) => x.v));
+  return (
+    <Screen title="Workouts" sub="Log sets as you train. Beat your estimated 1RM and the app flags a PR." onBack={undefined}>
+      <UnitChips />
+      <Inp value={ex} onChange={setEx} ph="Exercise (e.g. Back squat)" />
+      {names.length > 0 && <View style={s.chipRow}>{names.map((n) => <Pressable key={n} onPress={() => pick(n)} style={[s.chip, { paddingVertical: 5 }]}><Text style={[s.chipText, { fontSize: 13 }]}>{n}</Text></Pressable>)}</View>}
+      <View style={{ flexDirection: 'row' }}>
+        <Inp value={w} onChange={setW} num ph={`Weight (${unit})`} style={{ flex: 1, marginRight: 8 }} />
+        <Inp value={r} onChange={setR} num ph="Reps" style={{ flex: 1 }} />
+      </View>
+      <View style={[s.btnRow, { justifyContent: 'flex-start', marginBottom: 4 }]}>
+        {[['\u22122.5', -2.5], ['+2.5', 2.5], ['+5', 5]].map(([l, d]) => <Pressable key={l} onPress={() => setW(String(Math.max(0, r1(num(w) + d))))} style={[s.stepBtn, { marginRight: 8 }]}><Text style={s.chipText}>{l}</Text></Pressable>)}
+        {[['\u22121 rep', -1], ['+1 rep', 1]].map(([l, d]) => <Pressable key={l} onPress={() => setR(String(Math.max(1, Math.round(num(r)) + d)))} style={[s.stepBtn, { marginRight: 8 }]}><Text style={s.chipText}>{l}</Text></Pressable>)}
+      </View>
+      <Btn label="Log set" icon="add" onPress={add} disabled={!ex.trim()} />
+      <Text style={s.section}>Today · {todays.length} sets · {commas(Math.round(vol))} {unit} volume</Text>
+      {todays.length === 0 && <Text style={s.empty}>No sets logged yet today.</Text>}
+      {Object.keys(groups).map((n) => (
+        <View key={n} style={s.card}>
+          <Text style={[s.habitTitle, { flex: 0 }]}>{n}</Text>
+          {groups[n].map((x, i) => (
+            <View key={x.id} style={[s.between, { marginTop: 8 }]}>
+              <Text style={s.muted}>Set {i + 1}: {x.w} {unit} × {x.r}  (≈{r1(e1rm(x.w, x.r))} 1RM)</Text>
+              <Pressable onPress={() => setSets((l) => l.filter((y) => y.id !== x.id))} hitSlop={10}><Icon n="close" size={16} color={C.muted} /></Pressable>
+            </View>
+          ))}
+        </View>
+      ))}
+      <Text style={s.section}>Volume, last 7 days</Text>
+      <View style={s.card}>
+        <View style={s.bars}>
+          {week.map((x) => (
+            <View key={x.d} style={s.barCol}>
+              <View style={[s.bar, { height: 4 + (x.v / mx) * 70, backgroundColor: x.d === today ? C.accent : '#3A3A3F' }]} />
+              <Text style={s.barLbl}>{'SMTWTFS'[dateFrom(x.d).getDay()]}</Text>
+            </View>
+          ))}
+        </View>
+      </View>
+      {prs.length > 0 && <Text style={s.section}>Personal records (estimated 1RM)</Text>}
+      {prs.map((p) => <Row key={p.n} title={p.n} right={<Text style={s.habitTitle}>{r1(p.v)} {unit}</Text>} />)}
+    </Screen>
+  );
+}
+
+function Nutrition() {
+  const A = useApp();
+  const [food, setFood] = useMeta('food', []);
+  const nut = A.meta.nut || { cal: 2200, p: 140 };
+  const unit = A.meta.unit || 'kg';
+  const [name, setName] = useState(''), [cal, setCal] = useState(''), [p, setP] = useState('');
+  const [calc, setCalc] = useState(false), [sex, setSex] = useState('m'), [age, setAge] = useState('25'), [ht, setHt] = useState('175'), [wt, setWt] = useState('70'), [act, setAct] = useState(1.55), [goal, setGoal] = useState(0);
+  const today = dayKey(0);
+  const todays = food.filter((f) => keyOf(f.ts) === today);
+  const tc = sum(todays.map((f) => f.cal || 0)), tp = sum(todays.map((f) => f.p || 0));
+  const recent = [];
+  food.forEach((f) => { if (recent.length < 6 && !recent.some((x) => x.name.toLowerCase() === f.name.toLowerCase())) recent.push(f); });
+  const log = (n, c, pr) => { setFood((l) => [{ id: uid(), ts: Date.now(), name: n, cal: c, p: pr }, ...l].slice(0, 1500)); A.award('nutrition', 3); };
+  const add = () => { if (!name.trim() || (num(cal) <= 0 && num(p) <= 0)) return; log(name.trim(), Math.round(num(cal)), Math.round(num(p))); setName(''); setCal(''); setP(''); };
+  const kg = unit === 'lb' ? num(wt) * 0.4536 : num(wt);
+  const base = tdee(sex, num(age), num(ht), kg, act), calTarget = Math.max(1200, base + goal), pTarget = Math.round(kg * (goal < 0 ? 2.0 : 1.8));
+  const week = lastDays(7).slice().reverse().map((d) => ({ d, v: sum(food.filter((f) => keyOf(f.ts) === d).map((f) => f.cal || 0)) }));
+  const mx = Math.max(nut.cal, ...week.map((x) => x.v), 1);
+  return (
+    <Screen title="Nutrition" sub="Track calories and protein against targets that fit your body and goal." onBack={undefined}>
+      <View style={s.card}>
+        <View style={s.between}><Text style={s.muted}>Calories</Text><Text style={s.muted}>{tc} / {nut.cal}</Text></View>
+        <Bar pct={(tc / nut.cal) * 100} color={tc > nut.cal * 1.1 ? '#F87171' : C.accent} />
+        <View style={s.between}><Text style={s.muted}>Protein</Text><Text style={s.muted}>{tp} / {nut.p} g</Text></View>
+        <Bar pct={(tp / nut.p) * 100} color={C.online} />
+        <Text style={[s.muted, { fontSize: 12 }]}>{Math.max(0, nut.cal - tc)} kcal and {Math.max(0, nut.p - tp)} g protein left today.</Text>
+      </View>
+      {recent.length > 0 && <Label>Log again with one tap</Label>}
+      <View style={s.chipRow}>{recent.map((f) => <Pressable key={f.id} onPress={() => log(f.name, f.cal, f.p)} style={[s.chip, { paddingVertical: 5 }]}><Text style={[s.chipText, { fontSize: 13 }]}>{f.name} · {f.cal}</Text></Pressable>)}</View>
+      <Inp value={name} onChange={setName} ph="Food (e.g. Chicken and rice)" />
+      <View style={{ flexDirection: 'row' }}>
+        <Inp value={cal} onChange={setCal} num ph="Calories" style={{ flex: 1, marginRight: 8 }} />
+        <Inp value={p} onChange={setP} num ph="Protein (g)" style={{ flex: 1 }} onSubmit={add} />
+      </View>
+      <Btn label="Log food" icon="add" onPress={add} disabled={!name.trim()} />
+      {todays.map((f) => <Row key={f.id} title={f.name} sub={`${f.cal || 0} kcal · ${f.p || 0} g protein · ${timeOf(f.ts)}`} onDelete={() => setFood((l) => l.filter((x) => x.id !== f.id))} />)}
+      <Text style={s.section}>Calories, last 7 days</Text>
+      <View style={s.card}>
+        <View style={s.bars}>{week.map((x) => <View key={x.d} style={s.barCol}><View style={[s.bar, { height: 4 + (x.v / mx) * 70, backgroundColor: x.d === today ? C.accent : '#3A3A3F' }]} /><Text style={s.barLbl}>{'SMTWTFS'[dateFrom(x.d).getDay()]}</Text></View>)}</View>
+      </View>
+      <Btn label={calc ? 'Hide target calculator' : 'Calorie and protein target calculator'} kind="ghost" icon="calculator-outline" onPress={() => setCalc(!calc)} />
+      {calc && (
+        <View style={[s.card, { marginTop: 8 }]}>
+          <Label style={{ marginTop: 0 }}>Sex</Label><Chips opts={['m', 'f']} value={sex} onChange={setSex} show={(v) => (v === 'm' ? 'Male' : 'Female')} />
+          <Label>Weight unit</Label><UnitChips />
+          <View style={{ flexDirection: 'row' }}>
+            <View style={{ flex: 1, marginRight: 8 }}><Label>Age</Label><Inp value={age} onChange={setAge} num ph="Age" /></View>
+            <View style={{ flex: 1, marginRight: 8 }}><Label>Height (cm)</Label><Inp value={ht} onChange={setHt} num ph="cm" /></View>
+            <View style={{ flex: 1 }}><Label>Weight ({unit})</Label><Inp value={wt} onChange={setWt} num ph={unit} /></View>
+          </View>
+          <Label>Activity</Label>
+          <Chips opts={[1.2, 1.375, 1.55, 1.725]} value={act} onChange={setAct} show={(v) => ({ 1.2: 'Desk job', 1.375: 'Light', 1.55: 'Moderate', 1.725: 'Very active' }[v])} />
+          <Label>Goal</Label>
+          <Chips opts={[-500, 0, 300]} value={goal} onChange={setGoal} show={(v) => (v < 0 ? 'Lose fat' : v > 0 ? 'Build muscle' : 'Maintain')} />
+          <Text style={[s.bubbleText, { marginTop: 10 }]}>Maintenance about {base} kcal. Suggested target: {calTarget} kcal and {pTarget} g protein.</Text>
+          <Text style={[s.muted, { fontSize: 12 }]}>Estimates (Mifflin-St Jeor). Adjust to how your body responds over 2 to 3 weeks.</Text>
+          <Btn label="Use these as my targets" onPress={() => { A.setMeta((m) => ({ ...m, nut: { cal: calTarget, p: pTarget } })); A.toast('Targets updated'); }} />
+        </View>
+      )}
+    </Screen>
+  );
+}
+
+function BodyMetrics() {
+  const A = useApp();
+  const [body, setBody] = useMeta('body', {});
+  const unit = A.meta.unit || 'kg';
+  const [w, setW] = useState(''), [wa, setWa] = useState('');
+  const keys = Object.keys(body).sort();
+  const latest = keys.length ? body[keys[keys.length - 1]] : null;
+  const recent = keys.filter((k) => k >= dayKey(-7)).map((k) => body[k].w).filter((v) => v > 0);
+  const avg7 = recent.length ? sum(recent) / recent.length : null;
+  const old = keys.filter((k) => k <= dayKey(-14) && body[k].w > 0).pop();
+  const change = latest && latest.w > 0 && old ? r1(latest.w - body[old].w) : null;
+  const pts = keys.filter((k) => body[k].w > 0).slice(-14);
+  const lo = Math.min(...pts.map((k) => body[k].w)), hi = Math.max(...pts.map((k) => body[k].w));
+  const save = () => {
+    if (num(w) <= 0 && num(wa) <= 0) return;
+    setBody((b) => ({ ...b, [dayKey(0)]: { w: num(w) || (b[dayKey(0)] || {}).w || 0, waist: num(wa) || (b[dayKey(0)] || {}).waist || 0 } }));
+    A.award('body', 3); setW(''); setWa('');
+  };
+  return (
+    <Screen title="Body metrics" sub="Weigh in a few times a week. The 7-day average smooths out daily noise." onBack={undefined}>
+      <UnitChips />
+      <View style={s.tiles}>
+        <Tile label="Latest" value={latest && latest.w ? `${latest.w}` : '\u2013'} sub={unit} />
+        <Tile label="7-day avg" value={avg7 ? `${r1(avg7)}` : '\u2013'} sub={unit} />
+        <Tile label="vs 2 weeks" value={change === null ? '\u2013' : `${change > 0 ? '+' : ''}${change}`} sub={unit} />
+      </View>
+      <View style={{ flexDirection: 'row' }}>
+        <Inp value={w} onChange={setW} num ph={`Weight (${unit})`} style={{ flex: 1, marginRight: 8 }} />
+        <Inp value={wa} onChange={setWa} num ph="Waist (optional)" style={{ flex: 1 }} onSubmit={save} />
+      </View>
+      <Btn label="Save today's weigh-in" icon="checkmark" onPress={save} />
+      {pts.length > 1 && (
+        <View style={[s.card, { marginTop: 12 }]}>
+          <Text style={s.muted}>Trend (last {pts.length} weigh-ins)</Text>
+          <View style={s.bars}>{pts.map((k) => <View key={k} style={s.barCol}><View style={[s.bar, { width: 10, height: 8 + (hi === lo ? 30 : ((body[k].w - lo) / (hi - lo)) * 60), backgroundColor: k === dayKey(0) ? C.accent : '#3A3A3F' }]} /></View>)}</View>
+          <View style={s.between}><Text style={s.barLbl}>{lo}</Text><Text style={s.barLbl}>{hi}</Text></View>
+        </View>
+      )}
+      <Text style={s.section}>History</Text>
+      {keys.length === 0 && <Text style={s.empty}>No weigh-ins yet.</Text>}
+      {keys.slice().reverse().slice(0, 10).map((k) => <Row key={k} title={`${dLabel(k)} · ${body[k].w || '\u2013'} ${unit}`} sub={body[k].waist ? `Waist ${body[k].waist}` : undefined} onDelete={() => setBody((b) => { const c = { ...b }; delete c[k]; return c; })} />)}
+    </Screen>
+  );
+}
+
+function Fasting() {
+  const A = useApp();
+  const f = A.meta.fast || { start: null, goal: 16 }, [log, setLog] = useMeta('fastLog', []);
+  const el = f.start ? (Date.now() - f.start) / 36e5 : 0;
+  const setGoal = (g) => A.setMeta((m) => ({ ...m, fast: { ...(m.fast || {}), goal: g, start: (m.fast || {}).start || null } }));
+  const start = () => A.setMeta((m) => ({ ...m, fast: { goal: f.goal, start: Date.now() } }));
+  const end = () => {
+    const hrs = r1(el);
+    setLog((l) => [{ id: uid(), start: f.start, end: Date.now(), hrs, goal: f.goal }, ...l].slice(0, 120));
+    A.setMeta((m) => ({ ...m, fast: { goal: f.goal, start: null } }));
+    if (hrs >= f.goal) { A.award('fast', 6); A.toast(`Fast complete: ${hrs}h`); } else A.toast(`Ended after ${hrs}h`);
+  };
+  const week = log.filter((x) => x.end >= Date.now() - 7 * 864e5);
+  const met = week.filter((x) => x.hrs >= x.goal).length;
+  return (
+    <Screen title="Fasting" sub="Time-restricted eating, timed. Pick a window you can keep." onBack={undefined}>
+      <Chips opts={[12, 14, 16, 18, 20, 24]} value={f.goal} onChange={setGoal} show={(v) => `${v}h`} />
+      <View style={s.card}>
+        {f.start ? (
+          <>
+            <Text style={s.muted}>Fasting since {timeOf(f.start)}</Text>
+            <Text style={s.velocity}>{hm(el)}</Text>
+            <Bar pct={(el / f.goal) * 100} color={el >= f.goal ? C.online : C.accent} />
+            <Text style={s.muted}>{el >= f.goal ? 'Goal reached. End the fast when you are ready.' : `${hm(f.goal - el)} to your ${f.goal}h goal`}</Text>
+            <Btn label="End fast" onPress={end} />
+          </>
+        ) : (
+          <>
+            <Text style={[s.habitTitle, { flex: 0 }]}>Ready to start a {f.goal}h fast?</Text>
+            <Btn label="Start fasting timer" icon="hourglass-outline" onPress={start} />
+          </>
+        )}
+      </View>
+      <Text style={[s.muted, { fontSize: 12 }]}>Not medical advice. Skip fasting if you are under 18, pregnant, have diabetes, take medication that needs food, or have a history of disordered eating. Stop if you feel unwell.</Text>
+      <Text style={s.section}>Last 7 days: {met} of {week.length} goals met</Text>
+      {log.length === 0 && <Text style={s.empty}>No completed fasts yet.</Text>}
+      {log.slice(0, 10).map((x) => <Row key={x.id} title={`${x.hrs}h of ${x.goal}h`} sub={dLabel(keyOf(x.end))} accent={x.hrs >= x.goal ? C.online : '#FBBF24'} check done={x.hrs >= x.goal} onDelete={() => setLog((l) => l.filter((y) => y.id !== x.id))} />)}
+    </Screen>
+  );
+}
+
+function Calm({ mode }) {
+  const A = useApp();
+  const breathe = mode === 'breathe';
+  const [pat, setPat] = useState('box'), [secs, setSecs] = useState(breathe ? 180 : 600), [run, setRun] = useState(false), [el, setEl] = useState(0), [msg, setMsg] = useState('');
+  const t0 = useRef(0);
+  const total = A.meta.calm || {};
+  const logMins = (mins) => { if (mins <= 0) return; A.setMeta((m) => ({ ...m, calm: { ...(m.calm || {}), [dayKey(0)]: r1((((m.calm || {})[dayKey(0)]) || 0) + mins) } })); A.award('calm', 5); };
+  useEffect(() => {
+    if (!run) return undefined;
+    t0.current = Date.now() - el;
+    const t = setInterval(() => setEl(Date.now() - t0.current), 100);
+    return () => clearInterval(t);
+  }, [run]);
+  useEffect(() => {
+    if (run && el >= secs * 1000) {
+      setRun(false); setEl(0);
+      try { Vibration.vibrate([0, 400, 200, 400]); } catch (e) {}
+      logMins(secs / 60); setMsg(`Done. ${secs / 60} minutes logged.`);
+    }
+  }, [el, run]);
+  const stopEarly = () => { setRun(false); const m = Math.floor(el / 6000) / 10; setEl(0); if (m >= 1) { logMins(m); setMsg(`Ended early. ${m} minutes logged.`); } else setMsg('Ended before a minute, so nothing was logged.'); };
+  const ph = BREATH[pat].ph, st = breathe ? breathAt(ph, el) : null;
+  const size = 110 + (st ? st.fill : 0.5) * 110;
+  const remain = Math.max(0, Math.ceil((secs * 1000 - el) / 1000));
+  const streak = (() => { let n = 0, o = (total[dayKey(0)] || 0) > 0 ? 0 : -1; while ((total[dayKey(o)] || 0) > 0) { n++; o--; } return n; })();
+  return (
+    <Screen title={breathe ? 'Breathwork' : 'Meditation'} sub={breathe ? BREATH[pat].note : 'Sit still, eyes closed. When your mind wanders, return to the breath.'} onBack={undefined}>
+      {breathe && <Chips opts={Object.keys(BREATH)} value={pat} onChange={(v) => { if (!run) setPat(v); }} show={(v) => BREATH[v].name} />}
+      <Chips opts={breathe ? [60, 180, 300] : [300, 600, 900, 1200]} value={secs} onChange={(v) => { if (!run) setSecs(v); }} show={(v) => `${v / 60} min`} />
+      <View style={{ alignItems: 'center', justifyContent: 'center', height: 260 }}>
+        {breathe ? (
+          <View style={{ width: size, height: size, borderRadius: size / 2, borderWidth: 2, borderColor: C.accent, backgroundColor: 'rgba(244,244,245,0.08)', alignItems: 'center', justifyContent: 'center' }}>
+            <Text style={s.h1}>{run ? st.label : 'Ready'}</Text>
+            <Text style={s.muted}>{run ? `${st.left}s` : `${secs / 60} min`}</Text>
+          </View>
+        ) : <Text style={s.timer}>{pad(Math.floor((run ? remain : secs) / 60))}:{pad((run ? remain : secs) % 60)}</Text>}
+      </View>
+      {run ? <><Text style={[s.muted, { textAlign: 'center' }]}>{pad(Math.floor(remain / 60))}:{pad(remain % 60)} left</Text><Btn label="End early" kind="ghost" onPress={stopEarly} /></>
+        : <Btn label="Start" icon="play" onPress={() => { setMsg(''); setEl(0); setRun(true); }} />}
+      {!!msg && <Text style={[s.empty, { color: C.online }]}>{msg}</Text>}
+      <View style={s.tiles}>
+        <Tile label="Today" value={`${r1(total[dayKey(0)] || 0)}`} sub="minutes" />
+        <Tile label="Last 7 days" value={`${r1(sum(lastDays(7).map((d) => total[d] || 0)))}`} sub="minutes" />
+        <Tile label="Streak" value={`${streak}`} sub="days" />
+      </View>
+    </Screen>
+  );
+}
+const BreatheScreen = () => <Calm mode="breathe" />;
+const MeditateScreen = () => <Calm mode="meditate" />;
+
+/* ---------- Brain: games, reading, notes, decisions, models, principles ---------- */
+function MathSprint() {
+  const A = useApp();
+  const g = A.meta.games || {}, hist = g.math || [];
+  const [phase, setPhase] = useState('idle'), [score, setScore] = useState(0), [skips, setSkips] = useState(0), [q, setQ] = useState(mathQ(0)), [val, setVal] = useState(''), [left, setLeft] = useState(60);
+  const inputRef = useRef(null);
+  const lvl = Math.min(4, Math.floor(score / 6));
+  useEffect(() => {
+    if (phase !== 'run') return undefined;
+    const t = setInterval(() => setLeft((x) => x - 1), 1000);
+    return () => clearInterval(t);
+  }, [phase]);
+  useEffect(() => {
+    if (phase === 'run' && left <= 0) {
+      setPhase('done');
+      A.setMeta((m) => ({ ...m, games: { ...(m.games || {}), math: [...((m.games || {}).math || []), score].slice(-20) } }));
+      A.award('brain', 4);
+    }
+  }, [left, phase]);
+  const start = () => { setScore(0); setSkips(0); setLeft(60); setVal(''); setQ(mathQ(0)); setPhase('run'); setTimeout(() => inputRef.current && inputRef.current.focus(), 200); };
+  const change = (t) => {
+    setVal(t);
+    if (t !== '' && Number(t) === q.ans) { const n = score + 1; setScore(n); setVal(''); setQ(mathQ(Math.min(4, Math.floor(n / 6)))); }
+  };
+  const best = Math.max(0, ...hist);
+  return (
+    <Screen title="Math sprint" sub="Mental arithmetic for 60 seconds. It gets harder as you go. Type the answer, no Enter needed." onBack={undefined}>
+      <View style={s.tiles}>
+        <Tile label="Best" value={`${best}`} sub="solved" />
+        <Tile label="Last" value={hist.length ? `${hist[hist.length - 1]}` : '\u2013'} sub="solved" />
+        <Tile label="Runs" value={`${hist.length}`} sub="total" />
+      </View>
+      {phase === 'run' ? (
+        <View style={s.card}>
+          <View style={s.between}><Text style={s.muted}>Time {left}s</Text><Text style={s.muted}>Score {score} · Level {lvl + 1}</Text></View>
+          <Text style={[s.timer, { fontSize: 56, marginVertical: 18 }]}>{q.text}</Text>
+          <TextInput ref={inputRef} style={[s.addInput, { flex: 0, textAlign: 'center', fontSize: 28 }]} value={val} onChangeText={change} keyboardType="number-pad" placeholder="?" placeholderTextColor={C.muted} keyboardAppearance="dark" autoFocus />
+          <Btn label="Skip" kind="ghost" onPress={() => { setSkips(skips + 1); setVal(''); setQ(mathQ(lvl)); }} />
+        </View>
+      ) : (
+        <>
+          {phase === 'done' && <View style={s.card}><Text style={s.h1}>{score} solved</Text><Text style={s.muted}>{score >= best && score > 0 ? 'New personal best.' : `Your best is ${best}.`} Skipped {skips}.</Text></View>}
+          <Btn label={phase === 'done' ? 'Run it again' : 'Start 60-second sprint'} icon="play" onPress={start} />
+        </>
+      )}
+    </Screen>
+  );
+}
+
+function Stroop() {
+  const A = useApp();
+  const g = A.meta.games || {}, best = g.stroop || 0;
+  const [phase, setPhase] = useState('idle'), [ok, setOk] = useState(0), [bad, setBad] = useState(0), [q, setQ] = useState(stroopQ()), [left, setLeft] = useState(45);
+  useEffect(() => {
+    if (phase !== 'run') return undefined;
+    const t = setInterval(() => setLeft((x) => x - 1), 1000);
+    return () => clearInterval(t);
+  }, [phase]);
+  useEffect(() => {
+    if (phase === 'run' && left <= 0) {
+      setPhase('done');
+      const sc = Math.max(0, ok - bad);
+      A.setMeta((m) => ({ ...m, games: { ...(m.games || {}), stroop: Math.max((m.games || {}).stroop || 0, sc) } }));
+      A.award('brain', 4);
+    }
+  }, [left, phase]);
+  const tap = (i) => { if (i === q.ink) setOk(ok + 1); else setBad(bad + 1); setQ(stroopQ()); };
+  const acc = ok + bad ? Math.round((100 * ok) / (ok + bad)) : 0;
+  return (
+    <Screen title="Stroop drill" sub="Tap the color the word is printed in, not the word it spells. Trains attention control and impulse inhibition." onBack={undefined}>
+      <View style={s.tiles}><Tile label="Best score" value={`${best}`} sub="correct minus errors" /></View>
+      {phase === 'run' ? (
+        <View style={s.card}>
+          <View style={s.between}><Text style={s.muted}>Time {left}s</Text><Text style={s.muted}>{ok} right · {bad} wrong</Text></View>
+          <Text style={[s.timer, { fontSize: 64, color: STROOP[q.ink][1], marginVertical: 22 }]}>{q.word}</Text>
+          <View style={s.chipRow}>
+            {STROOP.map(([name], i) => <Pressable key={name} onPress={() => tap(i)} style={[s.ghost, { width: '48%', margin: '1%', alignItems: 'center', paddingVertical: 16 }]}><Text style={s.ghostText}>{name}</Text></Pressable>)}
+          </View>
+        </View>
+      ) : (
+        <>
+          {phase === 'done' && <View style={s.card}><Text style={s.h1}>Score {Math.max(0, ok - bad)}</Text><Text style={s.muted}>{ok} right, {bad} wrong, {acc}% accuracy.</Text></View>}
+          <Btn label={phase === 'done' ? 'Go again' : 'Start 45-second drill'} icon="play" onPress={() => { setOk(0); setBad(0); setLeft(45); setQ(stroopQ()); setPhase('run'); }} />
+        </>
+      )}
+    </Screen>
+  );
+}
+
+function SpeedReader() {
+  const A = useApp();
+  const [text, setText] = useState(SAMPLE_TEXT), [wpm, setWpm] = useState(300), [chunk, setChunk] = useState(1), [i, setI] = useState(0), [run, setRun] = useState(false), [fin, setFin] = useState(false);
+  const words = useMemo(() => text.split(/\s+/).filter(Boolean), [text]);
+  const best = (A.meta.games || {}).wpm || 0;
+  const cur = words.slice(i, i + chunk).join(' ');
+  useEffect(() => {
+    if (!run) return undefined;
+    if (i >= words.length) {
+      setRun(false); setFin(true);
+      if (words.length >= 50) { A.setMeta((m) => ({ ...m, games: { ...(m.games || {}), wpm: Math.max((m.games || {}).wpm || 0, wpm) } })); A.award('speed', 4); }
+      return undefined;
+    }
+    const t = setTimeout(() => setI((x) => x + chunk), wordDelay(cur, wpm));
+    return () => clearTimeout(t);
+  }, [run, i]);
+  return (
+    <Screen title="Speed reader" sub="Words appear one chunk at a time so your eyes stop wandering. Keep the meaning in mind, then summarize it afterwards." onBack={undefined}>
+      <View style={s.tiles}><Tile label="Best pace finished" value={best ? `${best}` : '\u2013'} sub="words per minute" /></View>
+      <Label style={{ marginTop: 0 }}>Speed (words per minute)</Label>
+      <Chips opts={[200, 300, 400, 500, 700]} value={wpm} onChange={setWpm} />
+      <Label>Words at a time</Label>
+      <Chips opts={[1, 2, 3]} value={chunk} onChange={setChunk} />
+      <View style={[s.card, { alignItems: 'center', minHeight: 150, justifyContent: 'center' }]}>
+        <Text style={[s.h1, { fontSize: 34, textAlign: 'center' }]}>{run || i > 0 ? (i >= words.length ? 'Done' : cur) : 'Ready'}</Text>
+      </View>
+      <Bar pct={words.length ? (i / words.length) * 100 : 0} />
+      <View style={{ flexDirection: 'row' }}>
+        <Pressable onPress={() => { setFin(false); if (i >= words.length) setI(0); setRun(!run); }} style={[s.addBtn, { flex: 1, marginLeft: 0, paddingVertical: 14, alignItems: 'center' }]}><Text style={s.addBtnText}>{run ? 'Pause' : i > 0 && i < words.length ? 'Resume' : 'Start'}</Text></Pressable>
+        <Pressable onPress={() => { setRun(false); setI(0); setFin(false); }} style={[s.ghost, { marginLeft: 8, justifyContent: 'center' }]}><Text style={s.ghostText}>Restart</Text></Pressable>
+      </View>
+      {fin && <Text style={[s.empty, { color: C.online }]}>Finished {words.length} words at {wpm} wpm. Now say the main idea out loud in one sentence.</Text>}
+      <Label>Paste your own text</Label>
+      <Inp value={text} onChange={(t) => { setText(t); setI(0); setRun(false); }} multi ph="Paste an article or chapter" />
+    </Screen>
+  );
+}
+
+function Books() {
+  const A = useApp();
+  const [books, setBooks] = useMeta('books', []);
+  const [title, setTitle] = useState(''), [pages, setPages] = useState(''), [open, setOpen] = useState(null), [note, setNote] = useState('');
+  const patch = (id, f) => setBooks((l) => l.map((b) => (b.id === id ? { ...b, ...f(b) } : b)));
+  const add = () => { if (!title.trim() || num(pages) <= 0) return; setBooks((l) => [{ id: uid(), title: title.trim(), pages: Math.round(num(pages)), page: 0, log: {}, notes: [], done: false }, ...l]); setTitle(''); setPages(''); };
+  const read = (b, n) => {
+    const np = Math.max(0, Math.min(b.pages, b.page + n)), diff = np - b.page;
+    if (!diff) return;
+    patch(b.id, (x) => ({ page: np, log: { ...x.log, [dayKey(0)]: Math.max(0, (x.log[dayKey(0)] || 0) + diff) }, done: np >= x.pages }));
+    if (diff > 0) A.award('read', 3);
+    if (np >= b.pages && !b.done && !b.paid) { patch(b.id, () => ({ paid: true })); A.setXp((x) => x + 20); A.toast(`Finished "${b.title}". +20 XP`); }
+  };
+  const pace = (b) => sum(lastDays(14).map((d) => b.log[d] || 0)) / 14;
+  const active = books.filter((b) => !b.done), fin = books.filter((b) => b.done);
+  const card = (b) => {
+    const p = pace(b), eta = p > 0 ? Math.ceil((b.pages - b.page) / p) : null;
+    return (
+      <View key={b.id} style={s.card}>
+        <View style={s.between}>
+          <Text style={[s.habitTitle, { flex: 1 }]}>{b.title}</Text>
+          <Pressable onPress={() => setBooks((l) => l.filter((x) => x.id !== b.id))} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable>
+        </View>
+        <Bar pct={(b.page / b.pages) * 100} color={b.done ? '#FBBF24' : C.accent} />
+        <Text style={s.muted}>Page {b.page} of {b.pages}{!b.done && eta !== null ? ` · about ${eta} day${eta === 1 ? '' : 's'} left at ${r1(p)} pages/day` : ''}</Text>
+        {!b.done && (
+          <View style={[s.btnRow, { justifyContent: 'flex-start', marginTop: 8 }]}>
+            {[10, 25, 50].map((n) => <Pressable key={n} onPress={() => read(b, n)} style={[s.logBtn, { marginRight: 8 }]}><Text style={s.logText}>+{n}</Text></Pressable>)}
+            <Pressable onPress={() => read(b, b.pages - b.page)} style={s.logBtn}><Text style={s.logText}>Finished</Text></Pressable>
+          </View>
+        )}
+        <Pressable onPress={() => setOpen(open === b.id ? null : b.id)} style={{ marginTop: 10 }}><Text style={s.muted}>{open === b.id ? 'Hide' : 'Show'} takeaways ({b.notes.length})</Text></Pressable>
+        {open === b.id && (
+          <View style={{ marginTop: 8 }}>
+            {b.notes.map((n) => <View key={n.id} style={[s.between, { marginBottom: 6 }]}><Text style={[s.bubbleText, { flex: 1, fontSize: 14 }]}>• {n.text}</Text><Pressable onPress={() => patch(b.id, (x) => ({ notes: x.notes.filter((y) => y.id !== n.id) }))} hitSlop={8}><Icon n="close" size={14} color={C.muted} /></Pressable></View>)}
+            <Inp value={note} onChange={setNote} ph="One idea worth keeping" onSubmit={() => { if (note.trim()) { patch(b.id, (x) => ({ notes: [...x.notes, { id: uid(), text: note.trim() }] })); setNote(''); } }} />
+          </View>
+        )}
+      </View>
+    );
+  };
+  return (
+    <Screen title="Reading list" sub="Readers compound. Track pages, pace and the ideas worth keeping." onBack={undefined}>
+      <Inp value={title} onChange={setTitle} ph="Book title" />
+      <View style={{ flexDirection: 'row' }}>
+        <Inp value={pages} onChange={setPages} num ph="Total pages" style={{ flex: 1, marginRight: 8 }} onSubmit={add} />
+        <Pressable onPress={add} style={[s.addBtn, { marginBottom: 8, marginLeft: 0 }, (!title.trim() || num(pages) <= 0) && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Add</Text></Pressable>
+      </View>
+      {books.length === 0 && <Text style={s.empty}>Add the book you are reading now.</Text>}
+      {active.map(card)}
+      {fin.length > 0 && <Text style={s.section}>Finished ({fin.length})</Text>}
+      {fin.map(card)}
+    </Screen>
+  );
+}
+
+const NOTE_TAGS = ['idea', 'learn', 'quote', 'lesson', 'todo', 'other'];
+function Notes() {
+  const A = useApp();
+  const [notes, setNotes] = useMeta('notes', []);
+  const [text, setText] = useState(''), [tag, setTag] = useState('idea'), [q, setQ] = useState(''), [f, setF] = useState('all');
+  const add = () => { if (!text.trim()) return; setNotes((l) => [{ id: uid(), ts: Date.now(), text: text.trim(), tag, pin: false }, ...l].slice(0, 1000)); A.award('note', 2); setText(''); };
+  const shown = notes.filter((n) => (f === 'all' || n.tag === f) && (!q.trim() || n.text.toLowerCase().includes(q.trim().toLowerCase()))).sort((a, b) => (b.pin ? 1 : 0) - (a.pin ? 1 : 0) || b.ts - a.ts);
+  return (
+    <Screen title="Second brain" sub={`${notes.length} notes. Capture everything, find it in seconds.`} onBack={undefined}>
+      <Inp value={text} onChange={setText} multi ph="Write an idea, lesson or quote" />
+      <Chips opts={NOTE_TAGS} value={tag} onChange={setTag} />
+      <Btn label="Save note" icon="add" onPress={add} disabled={!text.trim()} />
+      <Text style={s.section}>Find</Text>
+      <Inp value={q} onChange={setQ} ph="Search notes" />
+      <Chips opts={['all', ...NOTE_TAGS]} value={f} onChange={setF} />
+      {shown.length === 0 && <Text style={s.empty}>Nothing matches.</Text>}
+      {shown.map((n) => (
+        <View key={n.id} style={s.card}>
+          <View style={s.between}>
+            <Text style={s.muted}>{n.tag} · {dLabel(keyOf(n.ts))}</Text>
+            <View style={s.btnRow}>
+              {n.tag === 'todo' && <Pressable onPress={() => { A.addTask(n.text.slice(0, 120), 'discipline'); A.toast('Added to your tasks'); }} hitSlop={8}><Icon n="arrow-redo-outline" size={17} color={C.muted} style={{ marginRight: 12 }} /></Pressable>}
+              <Pressable onPress={() => setNotes((l) => l.map((x) => (x.id === n.id ? { ...x, pin: !x.pin } : x)))} hitSlop={8}><Icon n={n.pin ? 'pin' : 'pin-outline'} size={17} color={n.pin ? '#FBBF24' : C.muted} style={{ marginRight: 12 }} /></Pressable>
+              <Pressable onPress={() => setNotes((l) => l.filter((x) => x.id !== n.id))} hitSlop={8}><Icon n="close" size={17} color={C.muted} /></Pressable>
+            </View>
+          </View>
+          <Text style={[s.bubbleText, { marginTop: 6 }]}>{n.text}</Text>
+        </View>
+      ))}
+    </Screen>
+  );
+}
+
+function Decisions() {
+  const A = useApp();
+  const [ds, setDs] = useMeta('decisions', []);
+  const [title, setTitle] = useState(''), [why, setWhy] = useState(''), [exp, setExp] = useState(''), [conf, setConf] = useState(70), [rev, setRev] = useState(30);
+  const add = () => {
+    if (!title.trim()) return;
+    setDs((l) => [{ id: uid(), ts: Date.now(), title: title.trim(), why: why.trim(), expect: exp.trim(), conf, review: dayKey(rev), outcome: null }, ...l]);
+    A.award('decision', 4); setTitle(''); setWhy(''); setExp('');
+  };
+  const cal = calib(ds), pending = ds.filter((d) => !d.outcome).sort((a, b) => a.review.localeCompare(b.review)), done = ds.filter((d) => d.outcome);
+  return (
+    <Screen title="Decision journal" sub="Write the decision, your reasoning and your confidence now. Review it later. This is how you stop fooling yourself." onBack={undefined}>
+      {cal && (
+        <View style={s.tiles}>
+          <Tile label="Hit rate" value={`${cal.rate}%`} sub={`${cal.n} reviewed`} />
+          <Tile label="Confidence" value={`${cal.conf}%`} sub="your average" />
+          <Tile label="Gap" value={`${cal.gap > 0 ? '+' : ''}${cal.gap}`} sub={cal.gap > 10 ? 'overconfident' : cal.gap < -10 ? 'underconfident' : 'well calibrated'} color={Math.abs(cal.gap) <= 10 ? C.online : '#FBBF24'} />
+        </View>
+      )}
+      <Inp value={title} onChange={setTitle} ph="The decision (e.g. Take the new job)" />
+      <Inp value={why} onChange={setWhy} multi ph="Why? Options considered, key assumptions" style={{ minHeight: 70 }} />
+      <Inp value={exp} onChange={setExp} ph="What do you expect to happen?" />
+      <Label style={{ marginTop: 0 }}>Confidence you are right</Label>
+      <Chips opts={[50, 60, 70, 80, 90, 99]} value={conf} onChange={setConf} show={(v) => `${v}%`} />
+      <Label>Review it in</Label>
+      <Chips opts={[7, 14, 30, 90]} value={rev} onChange={setRev} show={(v) => `${v} days`} />
+      <Btn label="Record decision" icon="add" onPress={add} disabled={!title.trim()} />
+      {pending.length > 0 && <Text style={s.section}>Waiting for review</Text>}
+      {pending.map((d) => {
+        const dueNow = d.review <= dayKey(0);
+        return (
+          <View key={d.id} style={[s.card, dueNow && { borderColor: '#FBBF24' }]}>
+            <View style={s.between}><Text style={[s.habitTitle, { flex: 1 }]}>{d.title}</Text><Pressable onPress={() => setDs((l) => l.filter((x) => x.id !== d.id))} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable></View>
+            {!!d.expect && <Text style={s.muted}>Expected: {d.expect}</Text>}
+            <Text style={s.muted}>{d.conf}% confident · review {dueNow ? 'now' : `on ${dLabel(d.review)}`}</Text>
+            {dueNow && (
+              <View style={[s.btnRow, { justifyContent: 'flex-start', marginTop: 10 }]}>
+                {[['right', 'Right'], ['mixed', 'Mixed'], ['wrong', 'Wrong']].map(([k, l]) => <Pressable key={k} onPress={() => { setDs((x) => x.map((y) => (y.id === d.id ? { ...y, outcome: k } : y))); A.award('decision-review', 5); }} style={[s.logBtn, { marginRight: 8 }]}><Text style={s.logText}>{l}</Text></Pressable>)}
+              </View>
+            )}
+          </View>
+        );
+      })}
+      {done.length > 0 && <Text style={s.section}>Reviewed</Text>}
+      {done.slice(0, 15).map((d) => <Row key={d.id} title={d.title} sub={`${d.conf}% confident · it was ${d.outcome}`} accent={d.outcome === 'right' ? C.online : d.outcome === 'wrong' ? '#F87171' : '#FBBF24'} check done onDelete={() => setDs((l) => l.filter((x) => x.id !== d.id))} />)}
+    </Screen>
+  );
+}
+
+function DecisionMatrix() {
+  const [mx, setMx] = useMeta('matrix', { title: '', crit: [], opts: [] });
+  const [cn, setCn] = useState(''), [on, setOn] = useState('');
+  const maxPts = sum(mx.crit.map((c) => c.w * 5)) || 1;
+  const total = (o) => sum(mx.crit.map((c) => c.w * ((o.sc || {})[c.id] || 0)));
+  const ranked = mx.opts.slice().sort((a, b) => total(b) - total(a));
+  const upd = (f) => setMx((m) => f({ ...m }));
+  return (
+    <Screen title="Decision matrix" sub="Name what matters, weight it 1 to 5, then score each option 0 to 5. The math shows what you actually value." onBack={undefined}>
+      <Inp value={mx.title} onChange={(t) => upd((m) => ({ ...m, title: t }))} ph="What are you deciding?" />
+      <Text style={s.section}>Criteria</Text>
+      <View style={s.addRow}><TextInput style={s.addInput} value={cn} onChangeText={setCn} placeholder="e.g. Salary, Growth, Stress" placeholderTextColor={C.muted} keyboardAppearance="dark" onSubmitEditing={() => { if (cn.trim()) { upd((m) => ({ ...m, crit: [...m.crit, { id: uid(), name: cn.trim(), w: 3 }] })); setCn(''); } }} />
+        <Pressable onPress={() => { if (cn.trim()) { upd((m) => ({ ...m, crit: [...m.crit, { id: uid(), name: cn.trim(), w: 3 }] })); setCn(''); } }} style={[s.addBtn, !cn.trim() && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Add</Text></Pressable></View>
+      {mx.crit.map((c) => (
+        <View key={c.id} style={s.item}>
+          <Text style={s.itemText}>{c.name}</Text>
+          <Text style={[s.muted, { marginRight: 8 }]}>weight</Text>
+          {[1, 2, 3, 4, 5].map((w) => <Pressable key={w} onPress={() => upd((m) => ({ ...m, crit: m.crit.map((x) => (x.id === c.id ? { ...x, w } : x)) }))} style={[s.mini, { width: 30, marginRight: 4 }, c.w === w && { borderColor: C.accent, backgroundColor: C.raised }]}><Text style={s.chipText}>{w}</Text></Pressable>)}
+          <Pressable onPress={() => upd((m) => ({ ...m, crit: m.crit.filter((x) => x.id !== c.id) }))} hitSlop={8}><Icon n="close" size={16} color={C.muted} style={{ marginLeft: 6 }} /></Pressable>
+        </View>
+      ))}
+      <Text style={s.section}>Options</Text>
+      <View style={s.addRow}><TextInput style={s.addInput} value={on} onChangeText={setOn} placeholder="e.g. Job A, Job B" placeholderTextColor={C.muted} keyboardAppearance="dark" onSubmitEditing={() => { if (on.trim()) { upd((m) => ({ ...m, opts: [...m.opts, { id: uid(), name: on.trim(), sc: {} }] })); setOn(''); } }} />
+        <Pressable onPress={() => { if (on.trim()) { upd((m) => ({ ...m, opts: [...m.opts, { id: uid(), name: on.trim(), sc: {} }] })); setOn(''); } }} style={[s.addBtn, !on.trim() && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Add</Text></Pressable></View>
+      {mx.opts.map((o) => (
+        <View key={o.id} style={s.card}>
+          <View style={s.between}><Text style={[s.habitTitle, { flex: 1 }]}>{o.name}</Text><Pressable onPress={() => upd((m) => ({ ...m, opts: m.opts.filter((x) => x.id !== o.id) }))} hitSlop={8}><Icon n="close" size={18} color={C.muted} /></Pressable></View>
+          {mx.crit.map((c) => (
+            <View key={c.id} style={[s.between, { marginTop: 8 }]}>
+              <Text style={[s.muted, { flex: 1 }]}>{c.name} (×{c.w})</Text>
+              <View style={s.btnRow}>{[0, 1, 2, 3, 4, 5].map((v) => <Pressable key={v} onPress={() => upd((m) => ({ ...m, opts: m.opts.map((x) => (x.id === o.id ? { ...x, sc: { ...x.sc, [c.id]: v } } : x)) }))} style={[s.mini, { width: 28, marginRight: 3, paddingVertical: 4 }, (o.sc || {})[c.id] === v && { borderColor: C.accent, backgroundColor: C.raised }]}><Text style={s.chipText}>{v}</Text></Pressable>)}</View>
+            </View>
+          ))}
+        </View>
+      ))}
+      {ranked.length > 0 && mx.crit.length > 0 && (
+        <>
+          <Text style={s.section}>Ranking</Text>
+          <View style={s.card}>
+            {ranked.map((o, i) => (
+              <View key={o.id} style={{ marginBottom: 6 }}>
+                <View style={s.between}><Text style={[s.habitTitle, { flex: 0 }]}>{i === 0 ? 'Best: ' : ''}{o.name}</Text><Text style={s.muted}>{total(o)} / {maxPts}</Text></View>
+                <Bar pct={(total(o) / maxPts) * 100} color={i === 0 ? C.online : C.muted} />
+              </View>
+            ))}
+            <Text style={[s.muted, { fontSize: 12 }]}>If the winner feels wrong, a criterion is missing or mis-weighted. That is useful information too.</Text>
+          </View>
+        </>
+      )}
+      <Btn label="Clear matrix" kind="ghost" onPress={() => setMx({ title: '', crit: [], opts: [] })} />
+    </Screen>
+  );
+}
+
+function PreMortem() {
+  const A = useApp();
+  const [list, setList] = useMeta('premortems', []);
+  const [proj, setProj] = useState(''), [fail, setFail] = useState(''), [fix, setFix] = useState('');
+  const add = () => { if (!proj.trim() || !fail.trim()) return; setList((l) => [{ id: uid(), ts: Date.now(), proj: proj.trim(), fail: fail.trim(), fix: fix.trim() }, ...l]); A.award('premortem', 4); setProj(''); setFail(''); setFix(''); };
+  return (
+    <Screen title="Pre-mortem" sub="Assume it already failed. Working backwards from failure finds risks that optimism hides." onBack={undefined}>
+      <Inp value={proj} onChange={setProj} ph="Project or plan" />
+      <Inp value={fail} onChange={setFail} multi ph="It is 6 months from now and this failed. What went wrong? List every reason." />
+      <Inp value={fix} onChange={setFix} multi ph="What will you do now to prevent each one?" />
+      <Btn label="Save pre-mortem" icon="add" onPress={add} disabled={!proj.trim() || !fail.trim()} />
+      {list.map((p) => (
+        <View key={p.id} style={[s.card, { marginTop: 12 }]}>
+          <View style={s.between}><Text style={[s.habitTitle, { flex: 1 }]}>{p.proj}</Text><Pressable onPress={() => setList((l) => l.filter((x) => x.id !== p.id))} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable></View>
+          <Label>Why it failed</Label><Text style={s.bubbleText}>{p.fail}</Text>
+          {!!p.fix && <><Label>Prevention</Label><Text style={s.bubbleText}>{p.fix}</Text></>}
+          <Btn label="Red-team it with Coach" kind="ghost" icon="sparkles-outline" disabled={!A.online} onPress={() => A.analyze(`Red-team my plan "${p.proj}". I think it could fail because: ${p.fail}. My prevention ideas: ${p.fix || 'none yet'}. Find what I missed, rank the risks, and give me the 3 best mitigations.`)} />
+        </View>
+      ))}
+    </Screen>
+  );
+}
+
+function Models() {
+  const A = useApp();
+  const [applied, setApplied] = useMeta('mmApplied', {});
+  const [open, setOpen] = useState(null);
+  const daily = MODELS[dayOfYear() % MODELS.length];
+  const used = Object.keys(applied).length;
+  return (
+    <Screen title="Mental models" sub={`A new model each day. You have applied ${used} of ${MODELS.length}.`} onBack={undefined}>
+      <View style={[s.card, { borderColor: C.accent }]}>
+        <Text style={s.muted}>Model of the day</Text>
+        <Text style={[s.h1, { marginTop: 4 }]}>{daily.name}</Text>
+        <Text style={[s.bubbleText, { marginTop: 8 }]}>{daily.tip}</Text>
+        <Text style={[s.bigQ, { fontSize: 18, lineHeight: 24 }]}>{daily.ask}</Text>
+        <Btn label={`I applied this today${applied[daily.id] ? ` (${applied[daily.id]}×)` : ''}`} icon="checkmark" onPress={() => { setApplied((a) => ({ ...a, [daily.id]: (a[daily.id] || 0) + 1 })); A.award('model', 4); }} />
+      </View>
+      <Text style={s.section}>Library</Text>
+      {MODELS.map((m) => (
+        <Pressable key={m.id} onPress={() => setOpen(open === m.id ? null : m.id)} style={[s.item, { flexDirection: 'column', alignItems: 'flex-start' }]}>
+          <View style={[s.between, { width: '100%' }]}><Text style={[s.itemText, { flex: 0 }]}>{m.name}</Text><Text style={s.muted}>{applied[m.id] ? `used ${applied[m.id]}×` : ''}</Text></View>
+          {open === m.id && <><Text style={[s.muted, { marginTop: 6 }]}>{m.tip}</Text><Text style={[s.bubbleText, { marginTop: 6 }]}>Ask: {m.ask}</Text></>}
+        </Pressable>
+      ))}
+    </Screen>
+  );
+}
+
+const RULE_IDEAS = ['Do the hardest thing first', 'Decide once, then stop re-deciding', 'No phone for the first hour of the day'];
+const IDENTITY_IDEAS = ['I keep promises to myself', 'I am someone who trains no matter what', 'I learn something every day'];
+function Principles() {
+  const [pr, setPr] = useMeta('principles', { rules: [], identity: [] });
+  const [rule, setRule] = useState(''), [idt, setIdt] = useState('');
+  const rules = pr.rules || [], identity = pr.identity || [];
+  const addTo = (k, text, clear) => { if (!text.trim()) return; setPr((p) => ({ ...p, [k]: [...(p[k] || []), { id: uid(), text: text.trim() }] })); clear(''); };
+  const del = (k, id) => setPr((p) => ({ ...p, [k]: (p[k] || []).filter((x) => x.id !== id) }));
+  return (
+    <Screen title="Principles" sub="Rules you decide in advance, and the person you are becoming. One shows on Today every day and your Coach uses them." onBack={undefined}>
+      <Text style={s.section}>My rules</Text>
+      <View style={s.addRow}><TextInput style={s.addInput} value={rule} onChangeText={setRule} placeholder="A rule you live by" placeholderTextColor={C.muted} keyboardAppearance="dark" onSubmitEditing={() => addTo('rules', rule, setRule)} /><Pressable onPress={() => addTo('rules', rule, setRule)} style={[s.addBtn, !rule.trim() && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Add</Text></Pressable></View>
+      {rules.length === 0 && <View style={s.chipRow}>{RULE_IDEAS.map((x) => <Pressable key={x} onPress={() => addTo('rules', x, () => {})} style={[s.chip, { paddingVertical: 5 }]}><Text style={[s.chipText, { fontSize: 13 }]}>+ {x}</Text></Pressable>)}</View>}
+      {rules.map((x) => <Row key={x.id} title={x.text} onDelete={() => del('rules', x.id)} />)}
+      <Text style={s.section}>Who I am becoming</Text>
+      <View style={s.addRow}><TextInput style={s.addInput} value={idt} onChangeText={setIdt} placeholder="I am someone who..." placeholderTextColor={C.muted} keyboardAppearance="dark" onSubmitEditing={() => addTo('identity', idt, setIdt)} /><Pressable onPress={() => addTo('identity', idt, setIdt)} style={[s.addBtn, !idt.trim() && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Add</Text></Pressable></View>
+      {identity.length === 0 && <View style={s.chipRow}>{IDENTITY_IDEAS.map((x) => <Pressable key={x} onPress={() => addTo('identity', x, () => {})} style={[s.chip, { paddingVertical: 5 }]}><Text style={[s.chipText, { fontSize: 13 }]}>+ {x}</Text></Pressable>)}</View>}
+      {identity.map((x) => <Row key={x.id} title={x.text} onDelete={() => del('identity', x.id)} />)}
+    </Screen>
+  );
+}
+
+function Wins() {
+  const A = useApp();
+  const [wins, setWins] = useMeta('winsV', []);
+  const [text, setText] = useState(''), [proof, setProof] = useState(null);
+  const add = () => { if (!text.trim()) return; setWins((l) => [{ id: uid(), ts: Date.now(), text: text.trim() }, ...l].slice(0, 500)); A.award('win', 2); setText(''); };
+  return (
+    <Screen title="Wins vault" sub="Your brain remembers failures more than wins. Keep the evidence, and pull it out when doubt shows up." onBack={undefined}>
+      <Inp value={text} onChange={setText} ph="A win, big or small" onSubmit={add} />
+      <Btn label="Add to vault" icon="add" onPress={add} disabled={!text.trim()} />
+      <Btn label="Show me proof I can do hard things" kind="ghost" icon="medal-outline" disabled={wins.length === 0} onPress={() => setProof(wins[Math.floor(Math.random() * wins.length)])} />
+      {proof && <View style={[s.card, { marginTop: 12, borderColor: '#FBBF24' }]}><Text style={s.muted}>{dLabel(keyOf(proof.ts))}</Text><Text style={[s.bigQ, { fontSize: 20, lineHeight: 26 }]}>{proof.text}</Text></View>}
+      <Text style={s.section}>{wins.length} wins</Text>
+      {wins.slice(0, 40).map((w) => <Row key={w.id} title={w.text} sub={dLabel(keyOf(w.ts))} onDelete={() => setWins((l) => l.filter((x) => x.id !== w.id))} />)}
+    </Screen>
+  );
+}
+
+/* ---------- Execute: priorities, rituals, time, energy, projects ---------- */
+function PriorityMatrix() {
+  const A = useApp();
+  const open = A.tasks.filter((t) => !t.done);
+  const quad = (u, i) => open.filter((t) => !!t.urgent === u && !!t.imp === i);
+  const Q = [
+    { k: 'do', name: 'Do first', sub: 'Urgent and important', color: '#F87171', list: quad(true, true) },
+    { k: 'plan', name: 'Schedule', sub: 'Important, not urgent. Where results come from', color: C.online, list: quad(false, true) },
+    { k: 'del', name: 'Delegate or batch', sub: 'Urgent, not important', color: '#FBBF24', list: quad(true, false) },
+    { k: 'drop', name: 'Drop or defer', sub: 'Neither. Delete without guilt', color: C.muted, list: quad(false, false) },
+  ];
+  return (
+    <Screen title="Priority matrix" sub="Flag each open task as urgent and/or important. Most people live in urgent. Leverage lives in important." onBack={undefined}>
+      {open.length === 0 && <Text style={s.empty}>No open tasks. Add some on Today.</Text>}
+      {Q.map((q) => (
+        <View key={q.k} style={[s.card, { borderColor: q.color }]}>
+          <View style={s.between}><Text style={[s.habitTitle, { flex: 0, color: q.color }]}>{q.name} ({q.list.length})</Text></View>
+          <Text style={[s.muted, { fontSize: 12, marginBottom: 6 }]}>{q.sub}</Text>
+          {q.list.map((t) => (
+            <View key={t.id} style={{ marginTop: 8 }}>
+              <Text style={s.bubbleText}>{t.title}</Text>
+              <View style={[s.btnRow, { justifyContent: 'flex-start', marginTop: 6 }]}>
+                <Pressable onPress={() => A.flagTask(t.id, 'urgent')} style={[s.logBtn, { paddingVertical: 4, marginRight: 8 }, t.urgent && { borderColor: '#F87171' }]}><Text style={s.logText}>Urgent</Text></Pressable>
+                <Pressable onPress={() => A.flagTask(t.id, 'imp')} style={[s.logBtn, { paddingVertical: 4, marginRight: 8 }, t.imp && { borderColor: C.online }]}><Text style={s.logText}>Important</Text></Pressable>
+                {q.k === 'do' && !t.star && <Pressable onPress={() => A.starTask(t.id)} style={[s.logBtn, { paddingVertical: 4, marginRight: 8 }]}><Text style={s.logText}>Star it</Text></Pressable>}
+                {q.k === 'drop' && <Pressable onPress={() => A.deleteTask(t.id)} style={[s.logBtn, { paddingVertical: 4 }]}><Text style={s.logText}>Delete</Text></Pressable>}
+              </View>
+            </View>
+          ))}
+        </View>
+      ))}
+    </Screen>
+  );
+}
+
+function Shutdown() {
+  const A = useApp();
+  const t = dayKey(0), done = (A.meta.shutdown || {})[t];
+  const open = A.tasks.filter((x) => !x.done);
+  const [ids, setIds] = useState(() => (A.meta.ivy && A.meta.ivy.ids ? A.meta.ivy.ids.filter((id) => open.some((x) => x.id === id)) : []));
+  const [grat, setGrat] = useState(''), [one, setOne] = useState((A.meta.ivy && A.meta.ivy.one) || '');
+  const wins = A.activity[t] || 0, fm = (A.meta.focusDays || {})[t] || 0, doneT = A.tasks.filter((x) => x.done && x.doneOn === t).length;
+  const pl = A.plan, pd = pl ? pl.blocks.filter((b) => b.done).length : 0;
+  const toggle = (id) => setIds((l) => (l.includes(id) ? l.filter((x) => x !== id) : l.length >= 6 ? l : [...l, id]));
+  return (
+    <Screen title="Evening shutdown" sub="Close the loops, then set tomorrow up tonight. Your brain stops rehearsing the day, and you wake up with a plan." onBack={undefined}>
+      <View style={s.card}>
+        <Text style={[s.habitTitle, { flex: 0 }]}>1. Today in numbers</Text>
+        <Text style={[s.muted, { marginTop: 6 }]}>{wins} wins · {doneT} tasks finished · {fm} focus minutes{pl ? ` · ${pd}/${pl.blocks.length} plan blocks` : ''}</Text>
+      </View>
+      <View style={s.card}>
+        <Text style={[s.habitTitle, { flex: 0 }]}>2. One thing that went well</Text>
+        <Inp value={grat} onChange={setGrat} ph="Gratitude or a small win" style={{ marginTop: 8, marginBottom: 0 }} />
+      </View>
+      <View style={s.card}>
+        <Text style={[s.habitTitle, { flex: 0 }]}>3. Tomorrow's top {ids.length}/6 (Ivy Lee list)</Text>
+        <Text style={[s.muted, { marginBottom: 6 }]}>Tap tasks in the order you will do them. Finish #1 before touching #2.</Text>
+        {open.length === 0 && <Text style={s.muted}>No open tasks. Add some on Today first.</Text>}
+        {open.map((x) => { const n = ids.indexOf(x.id); return <Pressable key={x.id} onPress={() => toggle(x.id)} style={[s.planRow, n >= 0 && { borderColor: C.accent }]}><View style={[s.check, { borderColor: C.accent }, n >= 0 && { backgroundColor: C.accent }]}>{n >= 0 && <Text style={{ color: C.onAccent, fontWeight: '800', fontSize: 13 }}>{n + 1}</Text>}</View><Text style={[s.itemText, { flex: 1 }]}>{x.title}</Text></Pressable>; })}
+      </View>
+      <View style={s.card}>
+        <Text style={[s.habitTitle, { flex: 0 }]}>4. The one thing for tomorrow</Text>
+        <Inp value={one} onChange={setOne} ph="If I only do one thing, it is..." style={{ marginTop: 8, marginBottom: 0 }} />
+      </View>
+      {done ? <Text style={[s.empty, { color: C.online }]}>Shutdown complete for today. Rest well.</Text> : null}
+      <Btn label={done ? 'Update tomorrow' : 'Complete shutdown'} icon="power-outline" onPress={() => A.finishShutdown({ grat: grat.trim(), ids, one: one.trim() })} />
+    </Screen>
+  );
+}
+
+function TimeTracker() {
+  const A = useApp();
+  const [log, setLog] = useMeta('timeLog', []);
+  const tm = A.meta.timer;
+  const [label, setLabel] = useState(''), [cat, setCat] = useState('career');
+  const today = dayKey(0), tl = log.filter((x) => keyOf(x.end) === today);
+  const recent = [...new Set(log.map((x) => x.label))].slice(0, 6);
+  const start = () => { if (!label.trim()) return; A.setMeta((m) => ({ ...m, timer: { start: Date.now(), label: label.trim(), cat } })); setLabel(''); };
+  const stop = () => {
+    const mins = r1((Date.now() - tm.start) / 60000);
+    A.setMeta((m) => ({ ...m, timer: null }));
+    if (mins < 0.5) { A.toast('Under 30 seconds, so it was discarded'); return; }
+    setLog((l) => [{ id: uid(), start: tm.start, end: Date.now(), mins, label: tm.label, cat: tm.cat }, ...l].slice(0, 500));
+  };
+  const byCat = (days) => CATS.map((c) => ({ c, v: sum(log.filter((x) => days.includes(keyOf(x.end)) && x.cat === c.id).map((x) => x.mins)) }));
+  const t7 = byCat(lastDays(7)), mx = Math.max(1, ...t7.map((x) => x.v)), top = t7.slice().sort((a, b) => b.v - a.v)[0];
+  return (
+    <Screen title="Time tracker" sub="You cannot manage what you do not measure. Track a week and the truth about your time shows up." onBack={undefined}>
+      {tm ? (
+        <View style={[s.card, { borderColor: C.accent }]}>
+          <Text style={s.muted}>Tracking · {catOf(tm.cat).name}</Text>
+          <Text style={[s.habitTitle, { flex: 0, marginTop: 4 }]}>{tm.label}</Text>
+          <Text style={s.velocity}>{hm((Date.now() - tm.start) / 36e5)}</Text>
+          <Btn label="Stop and save" icon="stop" onPress={stop} />
+        </View>
+      ) : (
+        <>
+          <Inp value={label} onChange={setLabel} ph="What are you doing?" onSubmit={start} />
+          {recent.length > 0 && <View style={s.chipRow}>{recent.map((r) => <Pressable key={r} onPress={() => setLabel(r)} style={[s.chip, { paddingVertical: 5 }]}><Text style={[s.chipText, { fontSize: 13 }]}>{r}</Text></Pressable>)}</View>}
+          <CatChips value={cat} onChange={setCat} />
+          <Btn label="Start timer" icon="play" onPress={start} disabled={!label.trim()} />
+        </>
+      )}
+      <Text style={s.section}>Where your week went</Text>
+      <View style={s.card}>
+        {t7.map(({ c, v }) => <View key={c.id} style={{ marginBottom: 4 }}><View style={s.between}><Text style={s.muted}>{c.name}</Text><Text style={s.muted}>{hm(v / 60)}</Text></View><Bar pct={(v / mx) * 100} color={c.color} /></View>)}
+        {top && top.v > 0 && <Text style={[s.muted, { fontSize: 12 }]}>Biggest block: {top.c.name} with {hm(top.v / 60)} tracked this week.</Text>}
+      </View>
+      <Text style={s.section}>Today · {hm(sum(tl.map((x) => x.mins)) / 60)}</Text>
+      {tl.length === 0 && <Text style={s.empty}>Nothing tracked today.</Text>}
+      {tl.map((x) => <Row key={x.id} title={x.label} sub={`${catOf(x.cat).name} · ${timeOf(x.start)}`} right={<Text style={s.habitTitle}>{Math.round(x.mins)}m</Text>} onDelete={() => setLog((l) => l.filter((y) => y.id !== x.id))} />)}
+    </Screen>
+  );
+}
+
+function EnergyMap() {
+  const A = useApp();
+  const [log, setLog] = useMeta('energy', []);
+  const by = energyByHour(log), best = bestEnergy(log);
+  const hours = Array.from({ length: 19 }, (_, i) => i + 5);
+  const labels = ['Drained', 'Low', 'OK', 'Good', 'Peak'];
+  const now = new Date().getHours();
+  return (
+    <Screen title="Energy map" sub="Tap your energy a few times a day. After about 10 taps the app finds your real peak hours." onBack={undefined}>
+      <Text style={s.muted}>How is your energy right now?</Text>
+      <View style={[s.btnRow, { marginVertical: 10 }]}>
+        {[1, 2, 3, 4, 5].map((v) => <Pressable key={v} onPress={() => { setLog((l) => [{ ts: Date.now(), v }, ...l].slice(0, 400)); A.award('energy', 2); }} style={[s.ghost, { flex: 1, marginRight: v < 5 ? 6 : 0, alignItems: 'center', paddingHorizontal: 4 }]}><Text style={s.ghostText}>{v}</Text><Text style={[s.barLbl, { fontSize: 10 }]}>{labels[v - 1]}</Text></Pressable>)}
+      </View>
+      <View style={s.card}>
+        <Text style={s.muted}>Average energy by hour</Text>
+        <View style={s.bars}>
+          {hours.map((h) => <View key={h} style={s.barCol}><View style={[s.bar, { width: 9, height: by[h] ? 6 + (by[h] / 5) * 70 : 3, backgroundColor: best && h >= best.start && h < best.end ? C.online : h === now ? C.accent : '#3A3A3F' }]} />{h % 3 === 2 ? <Text style={[s.barLbl, { fontSize: 9 }]}>{h % 12 || 12}</Text> : <Text style={[s.barLbl, { fontSize: 9 }]}> </Text>}</View>)}
+        </View>
+        <Text style={[s.muted, { fontSize: 12 }]}>{log.length} taps logged.</Text>
+      </View>
+      {best ? (
+        <View style={s.card}>
+          <Text style={[s.habitTitle, { flex: 0 }]}>Your best window: {fmt(best.start)} to {fmt(best.end)}</Text>
+          <Text style={[s.muted, { marginTop: 4 }]}>Average energy {best.score} out of 5. Put your hardest work here.</Text>
+          {A.meta.peakOverride && A.meta.peakOverride.start === best.start ? <Text style={[s.muted, { color: C.online, marginTop: 6 }]}>This is already your peak window.</Text> : <Btn label="Use as my peak window" icon="flash-outline" onPress={() => { A.setMeta((m) => ({ ...m, peakOverride: { start: best.start, end: best.end } })); A.toast('Peak window updated everywhere'); }} />}
+          {!!A.meta.peakOverride && <Btn label="Go back to automatic peak" kind="ghost" onPress={() => A.setMeta((m) => ({ ...m, peakOverride: null }))} />}
+        </View>
+      ) : <Text style={s.empty}>Need {Math.max(0, 10 - log.length)} more taps to find your window.</Text>}
+    </Screen>
+  );
+}
+
+function AntiHabits() {
+  const A = useApp();
+  const [list, setList] = useMeta('anti', []);
+  const [title, setTitle] = useState('');
+  const t = dayKey(0);
+  const add = () => { if (!title.trim()) return; setList((l) => [...l, { id: uid(), title: title.trim(), start: t, resisted: [], slips: [] }]); setTitle(''); };
+  const patch = (id, f) => setList((l) => l.map((x) => (x.id === id ? { ...x, ...f(x) } : x)));
+  const clean = (x) => { const last = x.slips.slice().sort().pop(); return daysBetween(last || x.start, t); };
+  return (
+    <Screen title="Break bad habits" sub="List what you refuse to do. Mark each day you held the line. Your clean streak resets when you slip, and that is okay." onBack={undefined}>
+      <View style={s.addRow}><TextInput style={s.addInput} value={title} onChangeText={setTitle} placeholder="e.g. No social media before noon" placeholderTextColor={C.muted} keyboardAppearance="dark" onSubmitEditing={add} /><Pressable onPress={add} style={[s.addBtn, !title.trim() && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Add</Text></Pressable></View>
+      {list.length === 0 && <Text style={s.empty}>What is one thing you want to stop?</Text>}
+      {list.map((x) => {
+        const won = x.resisted.includes(t), slipped = x.slips.includes(t);
+        return (
+          <View key={x.id} style={s.card}>
+            <View style={s.between}><Text style={[s.habitTitle, { flex: 1 }]}>{x.title}</Text><Pressable onPress={() => setList((l) => l.filter((y) => y.id !== x.id))} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable></View>
+            <Text style={s.velocity}>{clean(x)}<Text style={s.muted}> clean days</Text></Text>
+            <Text style={s.muted}>Held the line {x.resisted.length} times · slipped {x.slips.length}</Text>
+            <View style={[s.btnRow, { justifyContent: 'flex-start', marginTop: 10 }]}>
+              <Pressable onPress={() => { if (!won) { patch(x.id, (y) => ({ resisted: [...y.resisted, t], slips: y.slips.filter((d) => d !== t) })); A.award(`anti:${x.id}`, 3); } }} style={[s.logBtn, { marginRight: 8 }, won && { borderColor: C.online }]}><Text style={s.logText}>{won ? 'Held today' : 'I held the line'}</Text></Pressable>
+              <Pressable onPress={() => { if (!slipped) patch(x.id, (y) => ({ slips: [...y.slips, t], resisted: y.resisted.filter((d) => d !== t) })); }} style={[s.logBtn, slipped && { borderColor: '#F87171' }]}><Text style={s.logText}>{slipped ? 'Slipped today' : 'I slipped'}</Text></Pressable>
+            </View>
+          </View>
+        );
+      })}
+    </Screen>
+  );
+}
+
+function Big3() {
+  const A = useApp();
+  const wk = mondayKey(0), b = A.meta.big3 && A.meta.big3.wk === wk ? A.meta.big3 : { wk, items: [], paid: false };
+  const [text, setText] = useState('');
+  const save = (items, paid) => A.setMeta((m) => ({ ...m, big3: { wk, items, paid: paid === undefined ? b.paid : paid } }));
+  const add = () => { if (!text.trim() || b.items.length >= 3) return; save([...b.items, { id: uid(), text: text.trim(), done: false }]); setText(''); };
+  const toggle = (id) => {
+    const items = b.items.map((x) => (x.id === id ? { ...x, done: !x.done } : x));
+    const all = items.length === 3 && items.every((x) => x.done);
+    if (all && !b.paid) { save(items, true); A.setXp((x) => x + 20); A.toast('All three done. +20 XP'); } else save(items);
+  };
+  return (
+    <Screen title="Weekly Big 3" sub="Three outcomes that would make this week a success. Not a to-do list. Resets every Monday." onBack={undefined}>
+      {b.items.length < 3 && <View style={s.addRow}><TextInput style={s.addInput} value={text} onChangeText={setText} placeholder={`Outcome ${b.items.length + 1} of 3`} placeholderTextColor={C.muted} keyboardAppearance="dark" onSubmitEditing={add} /><Pressable onPress={add} style={[s.addBtn, !text.trim() && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Add</Text></Pressable></View>}
+      {b.items.map((x) => <Row key={x.id} title={x.text} check done={x.done} accent={C.online} onPress={() => toggle(x.id)} onDelete={() => save(b.items.filter((y) => y.id !== x.id))} />)}
+      <Text style={s.muted}>{b.items.filter((x) => x.done).length} of {b.items.length || 3} done this week. Finishing all three earns 20 XP.</Text>
+    </Screen>
+  );
+}
+
+function Projects() {
+  const A = useApp();
+  const [list, setList] = useMeta('projects', []);
+  const [title, setTitle] = useState(''), [cat, setCat] = useState('career'), [step, setStep] = useState({});
+  const add = () => { if (!title.trim()) return; setList((l) => [{ id: uid(), title: title.trim(), cat, steps: [], touched: Date.now(), paid: false }, ...l]); setTitle(''); };
+  const patch = (id, f) => setList((l) => l.map((p) => (p.id === id ? { ...p, ...f(p) } : p)));
+  const toggle = (p, sid) => {
+    const steps = p.steps.map((x) => (x.id === sid ? { ...x, done: !x.done } : x));
+    patch(p.id, () => ({ steps, touched: Date.now() }));
+    if (steps.length > 0 && steps.every((x) => x.done) && !p.paid) { patch(p.id, () => ({ paid: true })); A.setXp((x) => x + 25); A.toast(`Project done: ${p.title}. +25 XP`); }
+  };
+  return (
+    <Screen title="Projects" sub="Every project needs a clear next action. Stalled projects get flagged after 7 quiet days." onBack={undefined}>
+      <Inp value={title} onChange={setTitle} ph="Project (an outcome with several steps)" onSubmit={add} />
+      <CatChips value={cat} onChange={setCat} />
+      <Btn label="Add project" icon="add" onPress={add} disabled={!title.trim()} />
+      {list.map((p) => {
+        const done = p.steps.filter((x) => x.done).length, next = p.steps.find((x) => !x.done), stalled = next && Date.now() - p.touched > 7 * 864e5;
+        return (
+          <View key={p.id} style={[s.card, { marginTop: 12 }, stalled && { borderColor: '#FBBF24' }]}>
+            <View style={s.between}><Text style={[s.habitTitle, { flex: 1 }]}>{p.title}</Text><Pressable onPress={() => setList((l) => l.filter((x) => x.id !== p.id))} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable></View>
+            <Bar pct={p.steps.length ? (done / p.steps.length) * 100 : 0} color={catOf(p.cat).color} />
+            <Text style={s.muted}>{done}/{p.steps.length} steps{stalled ? ' · stalled, pick the next action today' : ''}</Text>
+            {next && <Text style={[s.bubbleText, { marginTop: 6 }]}>Next: {next.text}</Text>}
+            {p.steps.map((x) => (
+              <View key={x.id} style={[s.between, { marginTop: 8 }]}>
+                <Pressable onPress={() => toggle(p, x.id)} style={[s.btnRow, { flex: 1, justifyContent: 'flex-start' }]}>
+                  <View style={[s.check, { width: 22, height: 22, borderRadius: 11, borderColor: catOf(p.cat).color, marginRight: 10 }, x.done && { backgroundColor: catOf(p.cat).color }]}>{x.done && <Icon n="checkmark" size={13} color="#000" />}</View>
+                  <Text style={[s.bubbleText, { flex: 1, fontSize: 15 }, x.done && s.done]}>{x.text}</Text>
+                </Pressable>
+                {!x.done && <Pressable onPress={() => { A.addTask(x.text, p.cat); A.toast('Sent to Today'); }} hitSlop={8}><Icon n="arrow-redo-outline" size={17} color={C.muted} style={{ marginLeft: 8 }} /></Pressable>}
+                <Pressable onPress={() => patch(p.id, (y) => ({ steps: y.steps.filter((z) => z.id !== x.id) }))} hitSlop={8}><Icon n="close" size={15} color={C.muted} style={{ marginLeft: 8 }} /></Pressable>
+              </View>
+            ))}
+            <View style={[s.addRow, { marginTop: 10, marginBottom: 0 }]}>
+              <TextInput style={s.addInput} value={step[p.id] || ''} onChangeText={(t) => setStep((o) => ({ ...o, [p.id]: t }))} placeholder="Add a next action" placeholderTextColor={C.muted} keyboardAppearance="dark"
+                onSubmitEditing={() => { const t = (step[p.id] || '').trim(); if (t) { patch(p.id, (y) => ({ steps: [...y.steps, { id: uid(), text: t, done: false }], touched: Date.now() })); setStep((o) => ({ ...o, [p.id]: '' })); } }} />
+            </View>
+          </View>
+        );
+      })}
+    </Screen>
+  );
+}
+
+function RoutineList({ kind }) {
+  const A = useApp();
+  const [text, setText] = useState('');
+  const steps = A.routineSteps(kind), done = A.routineDone(kind);
+  const edit = (f) => A.setMeta((m) => { const r = m.routines || {}; return { ...m, routines: { ...r, [kind]: f(r[kind] || DEFAULT_ROUTINES[kind]) } }; });
+  const streak = (() => { const d = (A.meta.routines || {}).done || {}; const ok = (k) => { const dn = (d[k] || {})[kind] || []; return steps.length > 0 && steps.every((x) => dn.includes(x.id)); }; let n = 0, o = ok(dayKey(0)) ? 0 : -1; while (ok(dayKey(o)) && n < 400) { n++; o--; } return n; })();
+  return (
+    <View>
+      <View style={s.tiles}><Tile label="Done today" value={`${steps.filter((x) => done.includes(x.id)).length}/${steps.length}`} /><Tile label="Streak" value={`${streak}`} sub="days complete" /></View>
+      {steps.map((x) => <Row key={x.id} title={x.text} check done={done.includes(x.id)} accent={C.online} onPress={() => A.routineToggle(kind, x.id)} onDelete={() => edit((l) => l.filter((y) => y.id !== x.id))} />)}
+      <View style={s.addRow}><TextInput style={s.addInput} value={text} onChangeText={setText} placeholder="Add a step" placeholderTextColor={C.muted} keyboardAppearance="dark" onSubmitEditing={() => { if (text.trim()) { edit((l) => [...l, { id: uid(), text: text.trim() }]); setText(''); } }} /><Pressable onPress={() => { if (text.trim()) { edit((l) => [...l, { id: uid(), text: text.trim() }]); setText(''); } }} style={[s.addBtn, !text.trim() && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Add</Text></Pressable></View>
+    </View>
+  );
+}
+function Routines() {
+  const [kind, setKind] = useState(new Date().getHours() < 15 ? 'morning' : 'evening');
+  return (
+    <Screen title="Routines" sub="Systems beat willpower. A fixed start and end to the day removes hundreds of small decisions." onBack={undefined}>
+      <Chips opts={['morning', 'evening']} value={kind} onChange={setKind} show={(v) => (v === 'morning' ? 'Morning' : 'Evening')} />
+      <RoutineList kind={kind} />
+    </Screen>
+  );
+}
+
+function Countdowns() {
+  const [list, setList] = useMeta('countdowns', []);
+  const [title, setTitle] = useState(''), [date, setDate] = useState('');
+  const ok = title.trim() && validDate(date.trim());
+  const add = () => { if (!ok) return; setList((l) => [...l, { id: uid(), title: title.trim(), date: date.trim() }].sort((a, b) => a.date.localeCompare(b.date))); setTitle(''); setDate(''); };
+  return (
+    <Screen title="Countdowns" sub="Deadlines and events you care about. Anything within two weeks shows on Today." onBack={undefined}>
+      <Inp value={title} onChange={setTitle} ph="Event (e.g. Exam, Launch, Trip)" />
+      <Inp value={date} onChange={setDate} ph="Date as YYYY-MM-DD" onSubmit={add} />
+      <View style={s.chipRow}>{[7, 30, 90].map((n) => <Pressable key={n} onPress={() => setDate(dayKey(n))} style={[s.chip, { paddingVertical: 5 }]}><Text style={[s.chipText, { fontSize: 13 }]}>In {n} days</Text></Pressable>)}</View>
+      <Btn label="Add countdown" icon="add" onPress={add} disabled={!ok} />
+      {!!date.trim() && !validDate(date.trim()) && <Text style={[s.muted, { color: '#F87171', marginTop: 6 }]}>Use the format YYYY-MM-DD, for example {dayKey(30)}.</Text>}
+      <Text style={s.section}>Coming up</Text>
+      {list.length === 0 && <Text style={s.empty}>No countdowns yet.</Text>}
+      {list.map((c) => { const n = daysUntil(c.date); return <Row key={c.id} title={c.title} sub={dLabel(c.date)} right={<Text style={[s.habitTitle, n < 0 && { color: C.muted }, n >= 0 && n <= 7 && { color: '#FBBF24' }]}>{n === 0 ? 'Today' : n > 0 ? `${n}d` : `${-n}d ago`}</Text>} onDelete={() => setList((l) => l.filter((x) => x.id !== c.id))} />; })}
+    </Screen>
+  );
+}
+
+/* ---------- Intelligence: briefing, levers, playbooks, search, hub, capture, retro ---------- */
+function Briefing() {
+  const A = useApp();
+  const { meta } = A;
+  const si = sleepInfo(meta), t = dayKey(0);
+  const items = [];
+  const push = (icon, title, text, go) => items.push({ icon, title, text, go });
+  push('moon-outline', 'Sleep', si.last == null ? 'Not logged yet. Log it so your analytics stay accurate.' : `${hm(si.last)} last night. Sleep debt ${si.debt.toFixed(1)}h. Bedtime tonight: ${fmt(si.bedTonight)}.`, 'sleep');
+  const pr = A.pk;
+  push('flash-outline', 'Peak window', `${fmt(pr.start)} to ${fmt(pr.end)}${meta.peakOverride ? ' (from your energy map)' : ''}. Protect it for your hardest work.`, 'focus');
+  if (A.plan) { const nx = A.plan.blocks.filter((b) => !b.done).slice(0, 3); push('calendar-outline', 'Plan', nx.length ? nx.map((b) => `${fmt(b.start)} ${b.title}`).join(' · ') : 'Every block is done. Excellent.', 'today'); }
+  else push('calendar-outline', 'Plan', 'No plan yet. Build one with Coach or let the offline auto-planner do it on Today.', 'today');
+  const iv = meta.ivy && meta.ivy.for === t ? meta.ivy : null;
+  if (iv) { const ts = iv.ids.map((id) => A.tasks.find((x) => x.id === id)).filter((x) => x && !x.done); if (iv.one || ts.length) push('podium-outline', 'From last night', `${iv.one ? `The one thing: ${iv.one}. ` : ''}${ts.length ? `Start with: ${ts[0].title}.` : ''}`, 'today'); }
+  const b3 = meta.big3 && meta.big3.wk === mondayKey(0) ? meta.big3.items : [];
+  if (b3.length) push('podium-outline', 'Weekly Big 3', `${b3.filter((x) => x.done).length}/${b3.length} done: ${b3.map((x) => x.text).join(' · ')}`, 'big3');
+  const left = A.habits.filter((h) => !h.log.includes(t)).length;
+  if (A.habits.length) push('flame-outline', 'Habits', left ? `${left} of ${A.habits.length} still to check in today.` : 'All habits checked in.', 'habits');
+  const due = A.cards.filter((c) => c.due <= t).length;
+  if (due) push('albums-outline', 'Flashcards', `${due} due for review.`, 'learn');
+  const dec = (meta.decisions || []).filter((d) => !d.outcome && d.review <= t).length;
+  if (dec) push('scale-outline', 'Decisions', `${dec} ready to review and calibrate.`, 'decisions');
+  const ppl = (meta.people || []).filter((p) => dueIn(p) <= 0);
+  if (ppl.length) push('people-outline', 'People', `Reach out to ${ppl.slice(0, 3).map((p) => p.name).join(', ')}${ppl.length > 3 ? ` and ${ppl.length - 3} more` : ''}.`, 'people');
+  const bd = (meta.people || []).map((p) => ({ p, n: bdayIn(p.bday) })).filter((x) => x.n !== null && x.n <= 7).sort((a, b) => a.n - b.n);
+  if (bd.length) push('gift-outline', 'Birthdays', bd.map((x) => `${x.p.name} ${x.n === 0 ? 'today' : `in ${x.n}d`}`).join(' · '), 'people');
+  const cd = (meta.countdowns || []).filter((c) => { const n = daysUntil(c.date); return n >= 0 && n <= 14; });
+  if (cd.length) push('alarm-outline', 'Deadlines', cd.map((c) => `${c.title} (${daysUntil(c.date) === 0 ? 'today' : `${daysUntil(c.date)}d`})`).join(' · '), 'countdowns');
+  const subs = (meta.subs || []).filter((x) => x.cycle !== 'year' && nextDay(x.day || 1) <= 3);
+  if (subs.length) push('card-outline', 'Renewals', subs.map((x) => `${x.name} ${money(x.amt, meta.cur || '$')}`).join(' · ') + ' renewing within 3 days.', 'subs');
+  if ((meta.budget || 0) > 0) { const sp = spentIn(meta.expenses || [], monthKey(0)); push('cash-outline', 'Budget', `${money(sp, meta.cur || '$')} of ${money(meta.budget, meta.cur || '$')} spent. About ${money(Math.max(0, (meta.budget - sp) / daysLeftMonth()), meta.cur || '$')} per day left.`, 'expenses'); }
+  const md = MODELS[dayOfYear() % MODELS.length];
+  push('construct-outline', 'Model of the day', `${md.name}: ${md.ask}`, 'models');
+  const rules = ((meta.principles || {}).rules || []);
+  if (rules.length) push('compass-outline', 'Your rule', rules[dayOfYear() % rules.length].text, 'principles');
+  const text = items.map((x) => `${x.title}: ${x.text}`).join('\n');
+  return (
+    <Screen title="Daily briefing" sub={`${dLabel(t)}. Everything that matters today, in one place.`} onBack={undefined}>
+      {items.map((x, i) => (
+        <Pressable key={i} onPress={() => A.go(x.go)} style={[s.item, { alignItems: 'flex-start' }]}>
+          <Icon n={x.icon} size={20} color={C.accent} style={{ marginRight: 12, marginTop: 2 }} />
+          <View style={{ flex: 1 }}><Text style={[s.habitTitle, { flex: 0, fontSize: 15 }]}>{x.title}</Text><Text style={[s.muted, { marginTop: 2 }]}>{x.text}</Text></View>
+          <Icon n="chevron-forward" size={16} color={C.muted} style={{ marginTop: 3 }} />
+        </Pressable>
+      ))}
+      <Btn label={A.online ? 'Brief me and set my priorities with AI' : 'AI briefing needs a connection'} icon="sparkles-outline" disabled={!A.online} onPress={() => A.analyze(`Give me my morning briefing. Here is my situation right now:\n${text}\nTell me the 3 things that matter most today, what to protect, and what to ignore.`)} />
+    </Screen>
+  );
+}
+
+function Levers() {
+  const A = useApp();
+  const { rows, days } = leverInsights(A.meta, A.activity, A.habits);
+  return (
+    <Screen title="Leverage insights" sub={`Which behaviors go with your best days, from ${days} days of your own data. Correlation, not proof, but a strong place to experiment.`} onBack={undefined}>
+      {rows.length === 0 && <Text style={s.empty}>Not enough data yet. Use the app for about two weeks and log sleep, workouts, water, focus and routines. The insights appear automatically.</Text>}
+      {rows.map((r, i) => {
+        const has = A.habits.some((h) => sameish(h.title, r.habit));
+        return (
+          <View key={r.id} style={[s.card, i === 0 && r.delta > 0 && { borderColor: C.online }]}>
+            <View style={s.between}><Text style={[s.habitTitle, { flex: 1 }]}>{r.label}</Text><Text style={[s.habitTitle, { flex: 0, color: r.delta > 0 ? C.online : '#F87171' }]}>{r.delta > 0 ? '+' : ''}{r.delta}</Text></View>
+            <Text style={s.muted}>wins per day. {r.withAvg} on {r.nWith} days with it, {r.withoutAvg} on {r.nWithout} days without.</Text>
+            {r.delta > 0.4 && !has && <Btn label="Make it a daily habit" kind="ghost" icon="add" onPress={() => { A.addHabit(r.habit, r.cat); A.toast('Habit added'); }} />}
+          </View>
+        );
+      })}
+    </Screen>
+  );
+}
+
+function Playbooks() {
+  const A = useApp();
+  const groups = [...new Set(PLAYBOOKS.map((p) => p.g))];
+  return (
+    <Screen title="Coach playbooks" sub="Expert frameworks in one tap. Some run on your own data right away, others open the Coach with the start of a prompt for you to finish." onBack={undefined}>
+      {groups.map((g) => (
+        <View key={g}>
+          <Text style={s.section}>{g}</Text>
+          {PLAYBOOKS.filter((p) => p.g === g).map((p) => (
+            <Pressable key={p.t} disabled={!A.online} onPress={() => (p.auto ? A.analyze(p.p) : A.draft(p.p))} style={[s.item, !A.online && { opacity: 0.4 }]}>
+              <Icon n={p.auto ? 'flash-outline' : 'create-outline'} size={18} color={C.accent} style={{ marginRight: 12 }} />
+              <Text style={s.itemText}>{p.t}</Text>
+              <Text style={s.muted}>{p.auto ? 'runs now' : 'you add detail'}</Text>
+            </Pressable>
+          ))}
+        </View>
+      ))}
+      {!A.online && <Text style={s.empty}>Playbooks need a connection.</Text>}
+    </Screen>
+  );
+}
+
+function SearchAll() {
+  const A = useApp();
+  const [q, setQ] = useState('');
+  const m = A.meta, k = q.trim().toLowerCase();
+  const hit = (x) => String(x || '').toLowerCase().includes(k);
+  const groups = k.length < 2 ? [] : [
+    ['Tasks', 'today', A.tasks.filter((x) => hit(x.title)).map((x) => x.title)],
+    ['Habits', 'habits', A.habits.filter((x) => hit(x.title)).map((x) => x.title)],
+    ['Notes', 'notes', (m.notes || []).filter((x) => hit(x.text)).map((x) => x.text)],
+    ['Journal', 'journal', (m.journal || []).filter((x) => hit(x.text)).map((x) => x.text)],
+    ['Books', 'books', (m.books || []).filter((x) => hit(x.title) || x.notes.some((n) => hit(n.text))).map((x) => x.title)],
+    ['Decisions', 'decisions', (m.decisions || []).filter((x) => hit(x.title) || hit(x.why)).map((x) => x.title)],
+    ['Goals', 'goals', (m.goals || []).filter((x) => hit(x.title)).map((x) => x.title)],
+    ['Projects', 'projects', (m.projects || []).filter((x) => hit(x.title) || x.steps.some((z) => hit(z.text))).map((x) => x.title)],
+    ['People', 'people', (m.people || []).filter((x) => hit(x.name) || hit(x.note)).map((x) => x.name)],
+    ['Wins', 'wins', (m.winsV || []).filter((x) => hit(x.text)).map((x) => x.text)],
+    ['Pre-mortems', 'premortem', (m.premortems || []).filter((x) => hit(x.proj) || hit(x.fail)).map((x) => x.proj)],
+    ['Expenses', 'expenses', (m.expenses || []).filter((x) => hit(x.note) || hit(x.cat)).map((x) => `${x.note || x.cat} · ${money(x.amt, m.cur || '$')}`)],
+    ['Principles', 'principles', [...((m.principles || {}).rules || []), ...((m.principles || {}).identity || [])].filter((x) => hit(x.text)).map((x) => x.text)],
+    ['Tools', null, REG.filter((r) => hit(r.name) || hit(r.desc)).map((r) => r.name)],
+  ].filter((g) => g[2].length);
+  return (
+    <Screen title="Search everything" sub="One box for every task, note, entry and tool." onBack={undefined}>
+      <Inp value={q} onChange={setQ} ph="Search (2+ letters)" />
+      {k.length >= 2 && groups.length === 0 && <Text style={s.empty}>No matches.</Text>}
+      {groups.map(([name, go, list]) => (
+        <View key={name}>
+          <Text style={s.section}>{name} ({list.length})</Text>
+          {list.slice(0, 6).map((txt, i) => <Pressable key={i} onPress={() => A.go(go || (REG.find((r) => r.name === txt) || {}).id || 'hub')} style={s.item}><Text style={s.itemText} numberOfLines={2}>{txt}</Text><Icon n="chevron-forward" size={16} color={C.muted} /></Pressable>)}
+        </View>
+      ))}
+    </Screen>
+  );
+}
+
+function Hub() {
+  const A = useApp();
+  const favs = A.meta.favs || [];
+  const toggleFav = (id) => A.setMeta((m) => { const f = m.favs || []; return { ...m, favs: f.includes(id) ? f.filter((x) => x !== id) : f.length >= 4 ? f : [...f, id] }; });
+  return (
+    <Screen title="All tools" sub="Star up to 4 tools to pin them on Today." onBack={undefined}>
+      <Pressable onPress={() => A.go('search')} style={[s.item, { marginBottom: 4 }]}><Icon n="search-outline" size={18} color={C.muted} style={{ marginRight: 10 }} /><Text style={[s.itemText, { color: C.muted }]}>Search everything</Text></Pressable>
+      {HUB_GROUPS.map((g) => (
+        <View key={g}>
+          <Text style={s.section}>{g}</Text>
+          <View style={s.chipRow}>
+            {REG.filter((r) => r.g === g).map((r) => (
+              <Pressable key={r.id} onPress={() => A.go(r.id)} style={s.hubCard}>
+                <View style={s.between}><Icon n={r.icon} size={22} color={C.accent} /><Pressable onPress={() => toggleFav(r.id)} hitSlop={8}><Icon n={favs.includes(r.id) ? 'star' : 'star-outline'} size={17} color={favs.includes(r.id) ? '#FBBF24' : C.muted} /></Pressable></View>
+                <Text style={[s.habitTitle, { flex: 0, fontSize: 15, marginTop: 8 }]}>{r.name}</Text>
+                <Text style={[s.muted, { fontSize: 12, lineHeight: 16 }]}>{r.desc}</Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
+      ))}
+    </Screen>
+  );
+}
+
+function QuickCapture({ visible, onClose }) {
+  const A = useApp();
+  const [text, setText] = useState(''), [kind, setKind] = useState('task');
+  useEffect(() => { if (visible) setText(''); }, [visible]);
+  const save = () => {
+    const t = text.trim();
+    if (!t) return;
+    if (kind === 'task') A.addTask(t, 'discipline');
+    else if (kind === 'note') A.setMeta((m) => ({ ...m, notes: [{ id: uid(), ts: Date.now(), text: t, tag: 'idea', pin: false }, ...(m.notes || [])].slice(0, 1000) }));
+    else if (kind === 'win') A.setMeta((m) => ({ ...m, winsV: [{ id: uid(), ts: Date.now(), text: t }, ...(m.winsV || [])].slice(0, 500) }));
+    else {
+      const mm = /^\s*([\d.,]+)\s*(.*)$/.exec(t);
+      if (!mm || num(mm[1]) <= 0) { A.toast('Start with the amount, like "12.50 lunch"'); return; }
+      A.setMeta((m) => ({ ...m, expenses: [{ id: uid(), ts: Date.now(), amt: num(mm[1]), cat: 'Other', note: mm[2].trim() }, ...(m.expenses || [])].slice(0, 3000) }));
+    }
+    A.toast(`Saved as ${kind}`); onClose();
+  };
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <KeyboardAvoidingView style={s.backdrop} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <View style={s.modal}>
+          <Text style={s.h1}>Quick capture</Text>
+          <Text style={[s.muted, { marginVertical: 8 }]}>Get it out of your head in two seconds.</Text>
+          <Chips opts={['task', 'note', 'win', 'expense']} value={kind} onChange={setKind} show={(v) => v[0].toUpperCase() + v.slice(1)} />
+          <TextInput style={[s.keyInput, { minHeight: 70, textAlignVertical: 'top' }]} value={text} onChangeText={setText} multiline autoFocus placeholder={kind === 'expense' ? 'e.g. 12.50 lunch' : 'Type it here'} placeholderTextColor={C.muted} keyboardAppearance="dark" />
+          <View style={[s.between, { marginTop: 16, justifyContent: 'flex-end' }]}>
+            <Pressable style={s.ghost} onPress={onClose}><Text style={s.ghostText}>Cancel</Text></Pressable>
+            <Pressable style={[s.ghost, { backgroundColor: text.trim() ? C.accent : C.disabled, marginLeft: 8 }]} onPress={save}><Text style={[s.ghostText, { color: C.onAccent }]}>Save</Text></Pressable>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
+function Retro() {
+  const A = useApp();
+  const [list, setList] = useMeta('retros', []);
+  const [well, setWell] = useState(''), [fix, setFix] = useState(''), [next, setNext] = useState('');
+  const wk = mondayKey(0), done = list.some((r) => r.wk === wk);
+  const save = () => { if (!well.trim() && !fix.trim() && !next.trim()) return; setList((l) => [{ id: uid(), wk, ts: Date.now(), well: well.trim(), fix: fix.trim(), next: next.trim() }, ...l.filter((r) => r.wk !== wk)].slice(0, 52)); A.award('retro', 10); setWell(''); setFix(''); setNext(''); };
+  return (
+    <Screen title="Weekly retro" sub="Five minutes once a week is the highest-return habit in this app. Look back, adjust, repeat." onBack={undefined}>
+      {done && <Text style={[s.muted, { color: C.online, marginBottom: 8 }]}>This week's retro is saved. Saving again replaces it.</Text>}
+      <Label style={{ marginTop: 0 }}>What worked this week?</Label><Inp value={well} onChange={setWell} multi />
+      <Label>What did not, and why?</Label><Inp value={fix} onChange={setFix} multi />
+      <Label>One change for next week</Label><Inp value={next} onChange={setNext} />
+      <Btn label="Save retro" icon="checkmark" onPress={save} />
+      <Btn label="See my numbers first" kind="ghost" onPress={() => A.go('review')} />
+      <Text style={s.section}>Past retros</Text>
+      {list.length === 0 && <Text style={s.empty}>None yet.</Text>}
+      {list.slice(0, 8).map((r) => (
+        <View key={r.id} style={s.card}>
+          <View style={s.between}><Text style={s.muted}>Week of {dLabel(r.wk)}</Text><Pressable onPress={() => setList((l) => l.filter((x) => x.id !== r.id))} hitSlop={10}><Icon n="close" size={17} color={C.muted} /></Pressable></View>
+          {!!r.well && <Text style={[s.bubbleText, { marginTop: 6 }]}>Worked: {r.well}</Text>}
+          {!!r.fix && <Text style={[s.bubbleText, { marginTop: 6 }]}>Didn't: {r.fix}</Text>}
+          {!!r.next && <Text style={[s.bubbleText, { marginTop: 6 }]}>Change: {r.next}</Text>}
+        </View>
+      ))}
+    </Screen>
+  );
+}
+
+/* Consistency heatmap (12 weeks) for Stats */
+function Heatmap({ activity }) {
+  const days = Array.from({ length: 84 }, (_, i) => dayKey(-(83 - i)));
+  const mx = Math.max(1, ...days.map((d) => activity[d] || 0));
+  const shade = (n) => (n === 0 ? '#17171A' : n / mx > 0.75 ? '#22C55E' : n / mx > 0.5 ? '#16A34A' : n / mx > 0.25 ? '#15803D' : '#14532D');
+  const cols = Array.from({ length: 12 }, (_, w) => days.slice(w * 7, w * 7 + 7));
+  const active = days.filter((d) => (activity[d] || 0) > 0).length;
+  return (
+    <View style={s.card}>
+      <View style={s.between}><Text style={s.muted}>Consistency, last 12 weeks</Text><Text style={s.muted}>{active} active days</Text></View>
+      <View style={{ flexDirection: 'row', justifyContent: 'center', marginTop: 10 }}>
+        {cols.map((c, i) => <View key={i}>{c.map((d) => <View key={d} style={[s.px, { backgroundColor: shade(activity[d] || 0), marginHorizontal: 2, marginVertical: 2 }]} />)}</View>)}
+      </View>
+    </View>
+  );
+}
+
+/* Extra cards on Today: principle, Ivy list, weekly big 3, routine, countdowns */
+function TodayExtras() {
+  const A = useApp();
+  const { meta } = A, t = dayKey(0), hr = new Date().getHours();
+  const rules = [...((meta.principles || {}).rules || []), ...((meta.principles || {}).identity || [])];
+  const rule = rules.length ? rules[dayOfYear() % rules.length].text : '';
+  const iv = meta.ivy && meta.ivy.for === t ? meta.ivy : null;
+  const ivTasks = iv ? iv.ids.map((id) => A.tasks.find((x) => x.id === id)).filter(Boolean) : [];
+  const b3 = meta.big3 && meta.big3.wk === mondayKey(0) ? meta.big3.items : [];
+  const kind = hr < 15 ? 'morning' : 'evening', steps = A.routineSteps(kind), done = A.routineDone(kind);
+  const cds = (meta.countdowns || []).filter((c) => { const n = daysUntil(c.date); return n >= 0 && n <= 14; }).slice(0, 3);
+  return (
+    <View>
+      {!!rule && <Text style={[s.muted, { fontStyle: 'italic', marginBottom: 12 }]}>"{rule}"</Text>}
+      {cds.length > 0 && <View style={[s.chipRow, { marginBottom: 4 }]}>{cds.map((c) => { const n = daysUntil(c.date); return <Pressable key={c.id} onPress={() => A.go('countdowns')} style={[s.chip, { paddingVertical: 5 }, n <= 3 && { borderColor: '#FBBF24' }]}><Text style={[s.chipText, { fontSize: 13 }]}>{c.title}: {n === 0 ? 'today' : `${n}d`}</Text></Pressable>; })}</View>}
+      {(iv && (ivTasks.length > 0 || !!iv.one)) && (
+        <View style={s.card}>
+          <Text style={s.muted}>Tomorrow's list, set last night</Text>
+          {!!iv.one && <Text style={[s.habitTitle, { flex: 0, marginTop: 6 }]}>The one thing: {iv.one}</Text>}
+          {ivTasks.map((x, i) => <Pressable key={x.id} onPress={() => A.toggleTask(x.id)} style={s.planRow}><View style={[s.check, { borderColor: C.accent }, x.done && { backgroundColor: C.accent }]}>{x.done ? <Icon n="checkmark" size={16} color={C.onAccent} /> : <Text style={{ color: C.accent, fontWeight: '800', fontSize: 13 }}>{i + 1}</Text>}</View><Text style={[s.itemText, x.done && s.done]}>{x.title}</Text></Pressable>)}
+        </View>
+      )}
+      {b3.length > 0 && (
+        <View style={s.card}>
+          <Pressable onPress={() => A.go('big3')} style={s.between}><Text style={s.muted}>Weekly Big 3 · {b3.filter((x) => x.done).length}/{b3.length}</Text><Icon n="chevron-forward" size={14} color={C.muted} /></Pressable>
+          {b3.map((x) => <Text key={x.id} style={[s.bubbleText, { marginTop: 6, fontSize: 15 }, x.done && s.done]}>{x.done ? '✓ ' : '○ '}{x.text}</Text>)}
+        </View>
+      )}
+      {steps.length > 0 && (
+        <View style={s.card}>
+          <Pressable onPress={() => A.go('routines')} style={s.between}><Text style={s.muted}>{kind === 'morning' ? 'Morning' : 'Evening'} routine · {steps.filter((x) => done.includes(x.id)).length}/{steps.length}</Text><Icon n="chevron-forward" size={14} color={C.muted} /></Pressable>
+          {steps.map((x) => <Pressable key={x.id} onPress={() => A.routineToggle(kind, x.id)} style={s.planRow}><View style={[s.check, { width: 22, height: 22, borderRadius: 11, borderColor: C.online }, done.includes(x.id) && { backgroundColor: C.online }]}>{done.includes(x.id) && <Icon n="checkmark" size={13} color="#000" />}</View><Text style={[s.itemText, { fontSize: 15 }, done.includes(x.id) && s.done]}>{x.text}</Text></Pressable>)}
+        </View>
+      )}
+    </View>
+  );
+}
+
+function AutoPlanButton() {
+  const A = useApp();
+  return (
+    <Pressable onPress={A.autoPlanNow} style={s.planBtn}>
+      <View style={s.btnRow}><Icon n="flash-outline" size={18} /><Text style={[s.planText, { marginLeft: 8 }]}>Auto-plan my day (works offline)</Text></View>
+    </Pressable>
+  );
+}
+
+function Fab({ onPress }) {
+  const ins = useSafeAreaInsets();
+  return (
+    <Pressable onPress={onPress} accessibilityLabel="Quick capture" style={[s.fab, { bottom: 70 + ins.bottom }]}>
+      <Icon n="add" size={28} color={C.onAccent} />
+    </Pressable>
+  );
+}
+
+/* ---------- Money: expenses, subscriptions, net worth, calculators ---------- */
+const EXP_CATS = ['Food', 'Transport', 'Home', 'Health', 'Learning', 'Fun', 'Bills', 'Other'];
+const CURRENCIES = ['$', '\u20AC', '\u00A3', '\u20B1', '\u00A5', '\u20B9'];
+function CurChips() {
+  const { meta, setMeta } = useApp();
+  return <Chips opts={CURRENCIES} value={meta.cur || '$'} onChange={(c) => setMeta((m) => ({ ...m, cur: c }))} />;
+}
+
+function Expenses() {
+  const A = useApp();
+  const cur = A.meta.cur || '$', budget = A.meta.budget || 0;
+  const [ex, setEx] = useMeta('expenses', []);
+  const [amt, setAmt] = useState(''), [cat, setCat] = useState('Food'), [note, setNote] = useState(''), [bud, setBud] = useState('');
+  const mk = monthKey(0), month = ex.filter((e) => keyOf(e.ts).slice(0, 7) === mk), spent = sum(month.map((e) => e.amt));
+  const today = sum(ex.filter((e) => keyOf(e.ts) === dayKey(0)).map((e) => e.amt)), week = sum(ex.filter((e) => keyOf(e.ts) >= dayKey(-6)).map((e) => e.amt));
+  const byCat = EXP_CATS.map((c) => ({ c, v: sum(month.filter((e) => e.cat === c).map((e) => e.amt)) })).filter((x) => x.v > 0).sort((a, b) => b.v - a.v);
+  const perDay = budget ? Math.max(0, budget - spent) / daysLeftMonth() : 0;
+  const add = () => { if (num(amt) <= 0) return; setEx((l) => [{ id: uid(), ts: Date.now(), amt: num(amt), cat, note: note.trim() }, ...l].slice(0, 3000)); A.award('expense', 2); setAmt(''); setNote(''); };
+  return (
+    <Screen title="Expenses" sub="What you track, you control. Log spending in seconds, see where it goes, and stay inside your budget." onBack={undefined}>
+      <CurChips />
+      <View style={s.tiles}>
+        <Tile label="Today" value={money(today, cur)} />
+        <Tile label="7 days" value={money(week, cur)} />
+        <Tile label="This month" value={money(spent, cur)} color={budget && spent > budget ? '#F87171' : undefined} />
+      </View>
+      {budget > 0 && (
+        <View style={s.card}>
+          <View style={s.between}><Text style={s.muted}>Monthly budget</Text><Text style={s.muted}>{money(spent, cur)} / {money(budget, cur)}</Text></View>
+          <Bar pct={(spent / budget) * 100} color={spent > budget ? '#F87171' : spent > budget * 0.8 ? '#FBBF24' : C.online} />
+          <Text style={[s.muted, { fontSize: 12 }]}>{spent > budget ? `Over budget by ${money(spent - budget, cur)}.` : `About ${money(perDay, cur)} per day left for ${daysLeftMonth()} days.`}</Text>
+        </View>
+      )}
+      <View style={{ flexDirection: 'row' }}>
+        <Inp value={amt} onChange={setAmt} num ph={`Amount (${cur})`} style={{ flex: 1, marginRight: 8 }} />
+        <Inp value={note} onChange={setNote} ph="Note (optional)" style={{ flex: 2 }} onSubmit={add} />
+      </View>
+      <Chips opts={EXP_CATS} value={cat} onChange={setCat} />
+      <Btn label="Add expense" icon="add" onPress={add} disabled={num(amt) <= 0} />
+      {byCat.length > 0 && <Text style={s.section}>This month by category</Text>}
+      {byCat.length > 0 && <View style={s.card}>{byCat.map((x) => <View key={x.c} style={{ marginBottom: 2 }}><View style={s.between}><Text style={s.muted}>{x.c}</Text><Text style={s.muted}>{money(x.v, cur)} · {Math.round((100 * x.v) / spent)}%</Text></View><Bar pct={(x.v / byCat[0].v) * 100} /></View>)}</View>}
+      <Text style={s.section}>Monthly budget</Text>
+      <View style={s.addRow}><TextInput style={s.addInput} value={bud} onChangeText={setBud} keyboardType="decimal-pad" placeholder={budget ? `Currently ${money(budget, cur)}` : 'Set a monthly budget'} placeholderTextColor={C.muted} keyboardAppearance="dark" /><Pressable onPress={() => { if (num(bud) >= 0 && bud.trim()) { A.setMeta((m) => ({ ...m, budget: num(bud) })); setBud(''); } }} style={[s.addBtn, !bud.trim() && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Set</Text></Pressable></View>
+      <Text style={s.section}>Recent</Text>
+      {ex.length === 0 && <Text style={s.empty}>No expenses logged yet.</Text>}
+      {ex.slice(0, 15).map((e) => <Row key={e.id} title={`${e.note || e.cat}`} sub={`${e.cat} · ${dLabel(keyOf(e.ts))}`} right={<Text style={s.habitTitle}>{money(e.amt, cur)}</Text>} onDelete={() => setEx((l) => l.filter((x) => x.id !== e.id))} />)}
+    </Screen>
+  );
+}
+
+function Subs() {
+  const A = useApp();
+  const cur = A.meta.cur || '$';
+  const [subs, setSubs] = useMeta('subs', []);
+  const [name, setName] = useState(''), [amt, setAmt] = useState(''), [cycle, setCycle] = useState('month'), [day, setDay] = useState('1');
+  const monthly = sum(subs.map(subMonthly)), top = subs.slice().sort((a, b) => subMonthly(b) - subMonthly(a))[0];
+  const add = () => { if (!name.trim() || num(amt) <= 0) return; setSubs((l) => [...l, { id: uid(), name: name.trim(), amt: num(amt), cycle, day: Math.max(1, Math.min(31, Math.round(num(day, 1)))) }]); setName(''); setAmt(''); };
+  return (
+    <Screen title="Subscriptions" sub="Small recurring costs quietly drain thousands a year. Put them all in one list." onBack={undefined}>
+      <CurChips />
+      <View style={s.tiles}>
+        <Tile label="Per month" value={money(monthly, cur)} />
+        <Tile label="Per year" value={money(monthly * 12, cur)} color={monthly > 0 ? '#FBBF24' : undefined} />
+        <Tile label="Count" value={`${subs.length}`} />
+      </View>
+      <Inp value={name} onChange={setName} ph="Service (e.g. Streaming, Gym)" />
+      <View style={{ flexDirection: 'row' }}>
+        <Inp value={amt} onChange={setAmt} num ph={`Cost (${cur})`} style={{ flex: 1, marginRight: 8 }} />
+        {cycle === 'month' && <Inp value={day} onChange={setDay} num ph="Renews on day" style={{ flex: 1 }} />}
+      </View>
+      <Chips opts={['month', 'year']} value={cycle} onChange={setCycle} show={(v) => (v === 'month' ? 'Monthly' : 'Yearly')} />
+      <Btn label="Add subscription" icon="add" onPress={add} disabled={!name.trim() || num(amt) <= 0} />
+      {top && subs.length > 1 && <Text style={[s.muted, { marginTop: 10 }]}>Biggest: {top.name} at {money(subMonthly(top) * 12, cur)} a year. Is it worth it?</Text>}
+      <Text style={s.section}>Your subscriptions</Text>
+      {subs.length === 0 && <Text style={s.empty}>None yet.</Text>}
+      {subs.slice().sort((a, b) => subMonthly(b) - subMonthly(a)).map((x) => <Row key={x.id} title={x.name} sub={x.cycle === 'year' ? `Yearly · ${money(x.amt / 12, cur)}/month` : `Renews in ${nextDay(x.day || 1)} days`} right={<Text style={s.habitTitle}>{money(x.amt, cur)}</Text>} onDelete={() => setSubs((l) => l.filter((y) => y.id !== x.id))} />)}
+    </Screen>
+  );
+}
+
+function NetWorth() {
+  const A = useApp();
+  const cur = A.meta.cur || '$';
+  const [nw, setNw] = useMeta('nw', { assets: [], debts: [], snaps: {} });
+  const [name, setName] = useState(''), [amt, setAmt] = useState(''), [kind, setKind] = useState('assets');
+  const assets = sum(nw.assets.map((x) => x.amt)), debts = sum(nw.debts.map((x) => x.amt)), net = assets - debts;
+  const write = (f) => setNw((n) => { const nx = f({ ...n }); return { ...nx, snaps: { ...(n.snaps || {}), [monthKey(0)]: sum(nx.assets.map((x) => x.amt)) - sum(nx.debts.map((x) => x.amt)) } }; });
+  const add = () => { if (!name.trim() || num(amt) < 0 || !amt.trim()) return; write((n) => ({ ...n, [kind]: [...n[kind], { id: uid(), name: name.trim(), amt: num(amt) }] })); setName(''); setAmt(''); };
+  const sk = Object.keys(nw.snaps || {}).sort().slice(-12), vals = sk.map((k) => nw.snaps[k]), lo = Math.min(...vals), hi = Math.max(...vals);
+  const prev = sk.length > 1 ? nw.snaps[sk[sk.length - 2]] : null;
+  return (
+    <Screen title="Net worth" sub="Assets minus debts, tracked monthly. Stored only on this device." onBack={undefined}>
+      <CurChips />
+      <View style={s.tiles}>
+        <Tile label="Assets" value={money(assets, cur)} color={C.online} />
+        <Tile label="Debts" value={money(debts, cur)} color={debts ? '#F87171' : undefined} />
+        <Tile label="Net worth" value={money(net, cur)} sub={prev === null ? undefined : `${net - prev >= 0 ? '+' : '-'}${money(Math.abs(net - prev), cur)} vs last month`} />
+      </View>
+      <Chips opts={['assets', 'debts']} value={kind} onChange={setKind} show={(v) => (v === 'assets' ? 'Asset' : 'Debt')} />
+      <Inp value={name} onChange={setName} ph={kind === 'assets' ? 'e.g. Savings, Index fund, Car' : 'e.g. Student loan, Card'} />
+      <Inp value={amt} onChange={setAmt} num ph={`Value (${cur})`} onSubmit={add} />
+      <Btn label={kind === 'assets' ? 'Add asset' : 'Add debt'} icon="add" onPress={add} disabled={!name.trim() || !amt.trim()} />
+      {sk.length > 1 && (
+        <View style={[s.card, { marginTop: 12 }]}>
+          <Text style={s.muted}>Net worth by month</Text>
+          <View style={s.bars}>{sk.map((k) => <View key={k} style={s.barCol}><View style={[s.bar, { width: 12, height: 8 + (hi === lo ? 30 : ((nw.snaps[k] - lo) / (hi - lo)) * 62), backgroundColor: k === monthKey(0) ? C.accent : '#3A3A3F' }]} /><Text style={[s.barLbl, { fontSize: 9 }]}>{k.slice(5)}</Text></View>)}</View>
+        </View>
+      )}
+      {nw.assets.length > 0 && <Text style={s.section}>Assets</Text>}
+      {nw.assets.map((x) => <Row key={x.id} title={x.name} right={<Text style={s.habitTitle}>{money(x.amt, cur)}</Text>} onDelete={() => write((n) => ({ ...n, assets: n.assets.filter((y) => y.id !== x.id) }))} />)}
+      {nw.debts.length > 0 && <Text style={s.section}>Debts</Text>}
+      {nw.debts.map((x) => <Row key={x.id} title={x.name} right={<Text style={[s.habitTitle, { color: '#F87171' }]}>{money(x.amt, cur)}</Text>} onDelete={() => write((n) => ({ ...n, debts: n.debts.filter((y) => y.id !== x.id) }))} />)}
+    </Screen>
+  );
+}
+
+function Calc() {
+  const A = useApp();
+  const cur = A.meta.cur || '$';
+  const [p, setP] = useState('1000'), [c, setC] = useState('200'), [rate, setRate] = useState('7'), [yrs, setYrs] = useState('20');
+  const [spend, setSpend] = useState(''), [saved, setSaved] = useState('0'), [save, setSave] = useState('500'), [ret, setRet] = useState('7');
+  const [inc, setInc] = useState(''), [hrs, setHrs] = useState('160'), [price, setPrice] = useState('');
+  const fv = futureValue(num(p), num(c), num(rate), num(yrs)), put = num(p) + num(c) * 12 * num(yrs), gain = fv - put;
+  const target = num(spend) * 25, fy = target > 0 ? (num(saved) >= target ? 0 : yearsToTarget(target, num(saved), num(save), num(ret))) : null;
+  const hourly = num(hrs) > 0 ? num(inc) / num(hrs) : 0;
+  return (
+    <Screen title="Wealth calculators" sub="Three numbers that change how you see money: compounding, your freedom number and what things cost in hours of your life." onBack={undefined}>
+      <CurChips />
+      <View style={s.card}>
+        <Text style={[s.habitTitle, { flex: 0 }]}>Compound growth</Text>
+        <View style={{ flexDirection: 'row', marginTop: 10 }}>
+          <View style={{ flex: 1, marginRight: 8 }}><Label style={{ marginTop: 0 }}>Start</Label><Inp value={p} onChange={setP} num /></View>
+          <View style={{ flex: 1, marginRight: 8 }}><Label style={{ marginTop: 0 }}>Monthly</Label><Inp value={c} onChange={setC} num /></View>
+          <View style={{ flex: 1, marginRight: 8 }}><Label style={{ marginTop: 0 }}>Return %</Label><Inp value={rate} onChange={setRate} num /></View>
+          <View style={{ flex: 1 }}><Label style={{ marginTop: 0 }}>Years</Label><Inp value={yrs} onChange={setYrs} num /></View>
+        </View>
+        <Text style={s.velocity}>{money(fv, cur)}</Text>
+        <Text style={s.muted}>You put in {money(put, cur)}. Growth adds {money(Math.max(0, gain), cur)} ({fv > 0 ? Math.round((100 * Math.max(0, gain)) / fv) : 0}% of the total).</Text>
+        <Text style={[s.muted, { fontSize: 12, marginTop: 4 }]}>Illustration only. Real returns vary and are not guaranteed.</Text>
+      </View>
+      <View style={s.card}>
+        <Text style={[s.habitTitle, { flex: 0 }]}>Financial independence number</Text>
+        <Text style={[s.muted, { marginTop: 4 }]}>25 times yearly spending, the common "4% rule" rule of thumb.</Text>
+        <View style={{ flexDirection: 'row', marginTop: 10 }}>
+          <View style={{ flex: 1, marginRight: 8 }}><Label style={{ marginTop: 0 }}>Yearly spend</Label><Inp value={spend} onChange={setSpend} num /></View>
+          <View style={{ flex: 1, marginRight: 8 }}><Label style={{ marginTop: 0 }}>Saved</Label><Inp value={saved} onChange={setSaved} num /></View>
+          <View style={{ flex: 1, marginRight: 8 }}><Label style={{ marginTop: 0 }}>Per month</Label><Inp value={save} onChange={setSave} num /></View>
+          <View style={{ flex: 1 }}><Label style={{ marginTop: 0 }}>Return %</Label><Inp value={ret} onChange={setRet} num /></View>
+        </View>
+        {target > 0 ? <><Text style={s.velocity}>{money(target, cur)}</Text><Text style={s.muted}>{fy === 0 ? 'You are already there.' : fy === null ? 'Not reachable within 100 years at these numbers. Raise savings or lower spending.' : `About ${r1(fy)} years at this pace.`}</Text></> : <Text style={[s.muted, { marginTop: 6 }]}>Enter your yearly spending to see your number.</Text>}
+      </View>
+      <View style={s.card}>
+        <Text style={[s.habitTitle, { flex: 0 }]}>Time is money</Text>
+        <View style={{ flexDirection: 'row', marginTop: 10 }}>
+          <View style={{ flex: 1, marginRight: 8 }}><Label style={{ marginTop: 0 }}>Monthly take-home</Label><Inp value={inc} onChange={setInc} num /></View>
+          <View style={{ flex: 1, marginRight: 8 }}><Label style={{ marginTop: 0 }}>Hours worked</Label><Inp value={hrs} onChange={setHrs} num /></View>
+          <View style={{ flex: 1 }}><Label style={{ marginTop: 0 }}>Price</Label><Inp value={price} onChange={setPrice} num /></View>
+        </View>
+        {hourly > 0 ? <><Text style={s.velocity}>{money(hourly, cur)}<Text style={s.muted}> per hour</Text></Text>{num(price) > 0 && <Text style={s.bubbleText}>That purchase costs {r1(num(price) / hourly)} hours of your working life.</Text>}</> : <Text style={[s.muted, { marginTop: 6 }]}>Enter your income and hours to see your real hourly worth.</Text>}
+      </View>
+    </Screen>
+  );
+}
+
+/* ---------- Growth: skills, people, wheel, life weeks, bucket list ---------- */
+function Skills() {
+  const A = useApp();
+  const [skills, setSkills] = useMeta('skills', []);
+  const [name, setName] = useState(''), [target, setTarget] = useState(100);
+  const add = () => { if (!name.trim()) return; setSkills((l) => [...l, { id: uid(), name: name.trim(), target, log: {} }]); setName(''); };
+  const logMin = (id, m) => { setSkills((l) => l.map((x) => (x.id === id ? { ...x, log: { ...x.log, [dayKey(0)]: Math.max(0, (x.log[dayKey(0)] || 0) + m) } } : x))); if (m > 0) A.award('skill', 4); };
+  return (
+    <Screen title="Skill tracker" sub="Deliberate practice hours compound. About 20 hours makes you functional, 100 competent, thousands excellent. Focus sessions can log here too." onBack={undefined}>
+      <Inp value={name} onChange={setName} ph="Skill (e.g. Spanish, Python, Guitar)" onSubmit={add} />
+      <Label style={{ marginTop: 0 }}>Hours goal</Label>
+      <Chips opts={[20, 100, 500, 1000, 10000]} value={target} onChange={setTarget} show={(v) => `${commas(v)}h`} />
+      <Btn label="Add skill" icon="add" onPress={add} disabled={!name.trim()} />
+      {skills.map((x) => {
+        const mins = skillMins(x), pace = sum(lastDays(14).map((d) => x.log[d] || 0)) / 14, left = x.target * 60 - mins, eta = pace > 0 && left > 0 ? Math.ceil(left / pace) : null;
+        return (
+          <View key={x.id} style={[s.card, { marginTop: 12 }]}>
+            <View style={s.between}><Text style={[s.habitTitle, { flex: 1 }]}>{x.name}</Text><Pressable onPress={() => setSkills((l) => l.filter((y) => y.id !== x.id))} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable></View>
+            <Bar pct={(mins / (x.target * 60)) * 100} color={mins >= x.target * 60 ? '#FBBF24' : C.accent} />
+            <Text style={s.muted}>{r1(mins / 60)}h of {commas(x.target)}h · today {x.log[dayKey(0)] || 0} min{eta ? ` · about ${eta} days to go at your pace` : ''}</Text>
+            <View style={[s.btnRow, { justifyContent: 'flex-start', marginTop: 10 }]}>
+              {[15, 30, 60].map((m) => <Pressable key={m} onPress={() => logMin(x.id, m)} style={[s.logBtn, { marginRight: 8 }]}><Text style={s.logText}>+{m}m</Text></Pressable>)}
+              <Pressable onPress={() => logMin(x.id, -15)} style={s.logBtn}><Text style={s.logText}>{'\u2212'}15m</Text></Pressable>
+            </View>
+          </View>
+        );
+      })}
+    </Screen>
+  );
+}
+
+function People() {
+  const A = useApp();
+  const [ppl, setPpl] = useMeta('people', []);
+  const [name, setName] = useState(''), [cad, setCad] = useState(30), [bday, setBday] = useState(''), [note, setNote] = useState('');
+  const bd = normMD(bday);
+  const add = () => { if (!name.trim()) return; setPpl((l) => [...l, { id: uid(), name: name.trim(), cadence: cad, last: '', bday: bd, note: note.trim() }]); setName(''); setBday(''); setNote(''); };
+  const touch = (id) => { setPpl((l) => l.map((x) => (x.id === id ? { ...x, last: dayKey(0) } : x))); A.award('people', 3); };
+  const sorted = ppl.slice().sort((a, b) => dueIn(a) - dueIn(b));
+  return (
+    <Screen title="People" sub="Your network is your net worth. Decide how often you want to be in touch and the app reminds you." onBack={undefined}>
+      <Inp value={name} onChange={setName} ph="Name" />
+      <Inp value={note} onChange={setNote} ph="Context (optional): how you know them, what they care about" />
+      <Label style={{ marginTop: 0 }}>Stay in touch every</Label>
+      <Chips opts={[7, 14, 30, 90]} value={cad} onChange={setCad} show={(v) => `${v} days`} />
+      <Inp value={bday} onChange={setBday} ph="Birthday as MM-DD (optional)" />
+      {!!bday.trim() && !bd && <Text style={[s.muted, { color: '#F87171' }]}>Use MM-DD, for example 03-27.</Text>}
+      <Btn label="Add person" icon="add" onPress={add} disabled={!name.trim()} />
+      <Text style={s.section}>{ppl.filter((x) => dueIn(x) <= 0).length} due now</Text>
+      {ppl.length === 0 && <Text style={s.empty}>Add the 5 people who matter most to your life and goals.</Text>}
+      {sorted.map((x) => {
+        const d = dueIn(x), b = bdayIn(x.bday);
+        return (
+          <View key={x.id} style={[s.card, d <= 0 && { borderColor: '#FBBF24' }]}>
+            <View style={s.between}><Text style={[s.habitTitle, { flex: 1 }]}>{x.name}</Text><Pressable onPress={() => setPpl((l) => l.filter((y) => y.id !== x.id))} hitSlop={10}><Icon n="close" size={18} color={C.muted} /></Pressable></View>
+            {!!x.note && <Text style={s.muted}>{x.note}</Text>}
+            <Text style={s.muted}>Every {x.cadence} days · {x.last ? `last contact ${daysBetween(x.last, dayKey(0))} days ago` : 'not contacted yet'}{b !== null && b <= 30 ? ` · birthday ${b === 0 ? 'today' : `in ${b} day${b === 1 ? '' : 's'}`}` : ''}</Text>
+            <View style={[s.between, { marginTop: 8 }]}>
+              <Text style={[s.logText, { color: d <= 0 ? '#FBBF24' : C.online }]}>{d <= 0 ? (x.last ? `Overdue ${-d} days` : 'Reach out now') : `Next in ${d} days`}</Text>
+              <Pressable onPress={() => touch(x.id)} style={s.logBtn}><Text style={s.logText}>I reached out</Text></Pressable>
+            </View>
+          </View>
+        );
+      })}
+    </Screen>
+  );
+}
+
+const WHEEL = ['Health', 'Career', 'Money', 'Relationships', 'Learning', 'Fun', 'Environment', 'Purpose'];
+function LifeWheel() {
+  const A = useApp();
+  const [wh, setWh] = useMeta('wheel', { cur: {}, hist: [] });
+  const cur = wh.cur || {}, hist = wh.hist || [];
+  const v = (a) => cur[a] || 5, avg = sum(WHEEL.map(v)) / WHEEL.length, low = WHEEL.slice().sort((a, b) => v(a) - v(b))[0];
+  const last = hist[0];
+  const set = (a, n) => setWh((w) => ({ ...w, cur: { ...(w.cur || {}), [a]: Math.max(1, Math.min(10, n)) } }));
+  const snap = () => { setWh((w) => ({ ...w, hist: [{ date: dayKey(0), avg: r1(avg), cur: Object.fromEntries(WHEEL.map((a) => [a, v(a)])) }, ...(w.hist || []).filter((h) => h.date !== dayKey(0))].slice(0, 24) })); A.award('wheel', 5); A.toast('Snapshot saved'); };
+  return (
+    <Screen title="Life wheel" sub="Rate 8 areas from 1 to 10, honestly. The lowest spoke limits how far the wheel rolls." onBack={undefined}>
+      <View style={s.card}><View style={s.between}><Text style={s.muted}>Balance score</Text><Text style={s.h1}>{r1(avg)}</Text></View>{last && <Text style={s.muted}>{avg - last.avg >= 0 ? '+' : ''}{r1(avg - last.avg)} since {dLabel(last.date)}</Text>}</View>
+      {WHEEL.map((a) => (
+        <View key={a} style={s.card}>
+          <View style={s.between}>
+            <Text style={[s.habitTitle, { flex: 1 }]}>{a}{last && last.cur[a] !== undefined && v(a) !== last.cur[a] ? `  (${v(a) > last.cur[a] ? '+' : ''}${v(a) - last.cur[a]})` : ''}</Text>
+            <View style={s.btnRow}>
+              <Pressable onPress={() => set(a, v(a) - 1)} style={s.stepBtn} hitSlop={6}><Icon n="remove" size={18} /></Pressable>
+              <Text style={[s.habitTitle, { flex: 0, width: 34, textAlign: 'center' }]}>{v(a)}</Text>
+              <Pressable onPress={() => set(a, v(a) + 1)} style={s.stepBtn} hitSlop={6}><Icon n="add" size={18} /></Pressable>
+            </View>
+          </View>
+          <Bar pct={v(a) * 10} color={a === low ? '#FBBF24' : C.accent} />
+        </View>
+      ))}
+      <Text style={[s.muted, { marginBottom: 6 }]}>Lowest area right now: {low} ({v(low)}/10).</Text>
+      <Btn label="Save snapshot" icon="checkmark" onPress={snap} />
+      <Btn label={`Plan 30 days to lift ${low}`} kind="ghost" icon="sparkles-outline" disabled={!A.online} onPress={() => A.analyze(`My life wheel scores (1-10): ${WHEEL.map((a) => `${a} ${v(a)}`).join(', ')}. My lowest area is ${low}. Give me a realistic 30-day plan to raise it, using what you know about my schedule, habits and goals. Include one tiny daily action.`)} />
+    </Screen>
+  );
+}
+
+function LifeWeeks() {
+  const A = useApp();
+  const birth = A.meta.birth || '', exp = A.meta.lifeExp || 85;
+  const [b, setB] = useState(birth);
+  const ok = validDate(birth), st = ok ? lifeStats(birth, exp) : null;
+  const whole = st ? Math.floor(st.years) : 0, frac = st ? st.years - whole : 0;
+  return (
+    <Screen title="Life in weeks" sub="Your time, made visible. Each square is one year of a typical life. This is not meant to scare you. It is meant to focus you." onBack={undefined}>
+      <Inp value={b} onChange={setB} ph="Your birth date as YYYY-MM-DD" onSubmit={() => { if (validDate(b.trim())) A.setMeta((m) => ({ ...m, birth: b.trim() })); }} />
+      <Btn label="Save birth date" kind="ghost" onPress={() => { if (validDate(b.trim()) && dateFrom(b.trim()) < new Date()) A.setMeta((m) => ({ ...m, birth: b.trim() })); else A.toast('Use a past date like 2001-04-23'); }} />
+      <Label>Expected lifespan</Label>
+      <Chips opts={[75, 80, 85, 90, 100]} value={exp} onChange={(n) => A.setMeta((m) => ({ ...m, lifeExp: n }))} />
+      {st ? (
+        <>
+          <View style={[s.card, { alignItems: 'center' }]}>
+            <View style={{ width: 10 * 22, flexDirection: 'row', flexWrap: 'wrap' }}>
+              {Array.from({ length: exp }, (_, i) => <View key={i} style={[s.px, { backgroundColor: i < whole ? C.accent : '#17171A', opacity: i === whole ? 0.35 + 0.65 * frac : 1, borderWidth: i === whole ? 1 : 0, borderColor: C.accent }]} />)}
+            </View>
+          </View>
+          <View style={s.tiles}>
+            <Tile label="Lived" value={`${st.pct}%`} sub={`${commas(st.weeks)} weeks`} />
+            <Tile label="Weeks left" value={commas(st.left)} sub="at this lifespan" />
+            <Tile label="Summers left" value={`${Math.max(0, Math.floor(exp - st.years))}`} sub="roughly" />
+          </View>
+          <Text style={s.bubbleText}>About {commas(st.left)} Saturdays remain. If you read one book a month you have roughly {commas(Math.floor(st.left / 4.345))} books left in you. Spend them on purpose.</Text>
+        </>
+      ) : <Text style={s.empty}>Enter your birth date to see your life in years.</Text>}
+    </Screen>
+  );
+}
+
+function Bucket() {
+  const A = useApp();
+  const [list, setList] = useMeta('bucket', []);
+  const [text, setText] = useState('');
+  const add = () => { if (!text.trim()) return; setList((l) => [...l, { id: uid(), text: text.trim(), done: false, paid: false }]); setText(''); };
+  const toggle = (x) => {
+    setList((l) => l.map((y) => (y.id === x.id ? { ...y, done: !y.done, paid: y.paid || !y.done } : y)));
+    if (!x.done && !x.paid) { A.setXp((v) => v + 15); A.toast('Checked off your bucket list. +15 XP'); }
+  };
+  const done = list.filter((x) => x.done).length;
+  return (
+    <Screen title="Bucket list" sub={`${done} of ${list.length} done. The things you will regret skipping, written down so they happen.`} onBack={undefined}>
+      <View style={s.addRow}><TextInput style={s.addInput} value={text} onChangeText={setText} placeholder="Something you want to do or see" placeholderTextColor={C.muted} keyboardAppearance="dark" onSubmitEditing={add} /><Pressable onPress={add} style={[s.addBtn, !text.trim() && { backgroundColor: C.disabled }]}><Text style={s.addBtnText}>Add</Text></Pressable></View>
+      {list.length === 0 && <Text style={s.empty}>Start with three things.</Text>}
+      {list.map((x) => <Row key={x.id} title={x.text} check done={x.done} accent="#FBBF24" onPress={() => toggle(x)} onDelete={() => setList((l) => l.filter((y) => y.id !== x.id))} />)}
+    </Screen>
+  );
+}
+
+const SCREEN_MAP = {
+  workout: Workout, nutrition: Nutrition, body: BodyMetrics, fasting: Fasting, breathe: BreatheScreen, meditate: MeditateScreen,
+  math: MathSprint, stroop: Stroop, speed: SpeedReader, books: Books, notes: Notes, models: Models, decisions: Decisions, decide: DecisionMatrix, premortem: PreMortem,
+  priority: PriorityMatrix, big3: Big3, projects: Projects, routines: Routines, timetrack: TimeTracker, energy: EnergyMap, shutdown: Shutdown, anti: AntiHabits, countdowns: Countdowns,
+  briefing: Briefing, levers: Levers, playbooks: Playbooks, search: SearchAll, retro: Retro,
+  expenses: Expenses, subs: Subs, networth: NetWorth, calc: Calc,
+  skills: Skills, people: People, principles: Principles, wins: Wins, wheel: LifeWheel, lifeweeks: LifeWeeks, bucket: Bucket, hub: Hub,
+};
+const SUB_IDS = ['sleep', 'journal', 'goals', 'badges', 'review', ...Object.keys(SCREEN_MAP)];
 /* ---------- Today ---------- */
 function PlanCard({ plan, online, busy, onToggle, onClear, onReplan }) {
   const d = new Date(), now = d.getHours() + d.getMinutes() / 60;
@@ -807,8 +2754,6 @@ function PlanCard({ plan, online, busy, onToggle, onClear, onReplan }) {
   );
 }
 
-const TOOLS = [['sleep', 'moon-outline', 'Sleep'], ['journal', 'book-outline', 'Journal'], ['goals', 'trophy-outline', 'Goals'], ['badges', 'ribbon-outline', 'Badges'], ['review', 'document-text-outline', 'Review']];
-
 function Today({
   name, tasks, habits, xp, online, busy, activity, focusMin, meta, setMeta, pk, inPeak, plan, tomorrowPlan, score, nudgeList,
   onOpen, onUrge, onToggle, onAdd, onDelete, onPlan, onStar, onRepeat, onClearDone, onToggleBlock, onClearPlan, onWater,
@@ -825,6 +2770,7 @@ function Today({
     return { c, total: ts.length + hs.length, done: ts.filter((t) => t.done).length + hs.filter((h) => h.log.includes(today)).length };
   });
   const water = (meta.water || {})[today] || 0, wg = meta.waterGoal || 8;
+  const favs = (meta.favs && meta.favs.length ? meta.favs : ['sleep', 'journal', 'goals', 'review']).map(regOf).filter(Boolean).slice(0, 4);
   const hello = hr < 5 ? 'Still up' : hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
   const go = (g) => (g === 'plan' ? onPlan() : g ? onOpen(g) : null);
   const scoreColor = score.score >= 70 ? C.online : score.score >= 40 ? '#FBBF24' : '#F87171';
@@ -850,10 +2796,11 @@ function Today({
 
       {plan ? <PlanCard plan={plan} online={online} busy={busy} onToggle={onToggleBlock} onClear={onClearPlan} onReplan={onPlan} /> : null}
       {!plan && tomorrowPlan ? <Text style={[s.muted, { marginBottom: 12 }]}>Tomorrow's plan is ready ({tomorrowPlan.blocks.length} blocks). It shows up here once the day starts.</Text> : null}
+      <TodayExtras />
 
       <View style={s.toolRow}>
-        {TOOLS.map(([id, ic, label]) => (
-          <Pressable key={id} onPress={() => onOpen(id)} style={s.tool}><Icon n={ic} size={22} /><Text style={[s.tabLabel, { color: C.text }]}>{label}</Text></Pressable>
+        {[...favs.map((r) => [r.id, r.icon, shortOf(r)]), ['hub', 'apps-outline', 'All tools']].map(([id, ic, label]) => (
+          <Pressable key={id} onPress={() => onOpen(id)} style={s.tool}><Icon n={ic} size={22} /><Text style={[s.tabLabel, { color: C.text }]} numberOfLines={1}>{label}</Text></Pressable>
         ))}
       </View>
 
@@ -914,6 +2861,8 @@ function Today({
       <Pressable disabled={!online || busy} onPress={onPlan} style={[s.planBtn, (!online || busy) && { opacity: 0.4 }]}>
         <View style={s.btnRow}><Icon n="sparkles-outline" size={18} /><Text style={[s.planText, { marginLeft: 8 }]}>{busy ? 'Coach is planning your day…' : online ? 'Ask Coach to plan my day' : 'Coach planning needs a connection'}</Text></View>
       </Pressable>
+
+      <AutoPlanButton />
 
       <View style={[s.between, { marginTop: 24, marginBottom: 12 }]}>
         <Text style={[s.section, { marginTop: 0, marginBottom: 0 }]}>Tasks</Text>
@@ -1069,7 +3018,7 @@ function PeakCard({ meta, setMeta, pk, inPeak, onSleep }) {
           <Pressable key={v} onPress={() => setMeta((m) => ({ ...m, wake: v }))} style={[s.mini, Math.round(meta.wake) === v && { borderColor: C.accent, backgroundColor: C.raised }]}><Text style={s.chipText}>{v}</Text></Pressable>
         ))}
       </View>
-      <Text style={[s.muted, { marginTop: 8, fontSize: 12 }]}>{pk.learned ? 'Learned from when you actually finish focus sessions.' : 'Estimated from your wake time and sleep. Learns your real peak after 3 focus sessions.'}</Text>
+      <Text style={[s.muted, { marginTop: 8, fontSize: 12 }]}>{pk.custom ? 'Set from your own energy map.' : pk.learned ? 'Learned from when you actually finish focus sessions.' : 'Estimated from your wake time and sleep. Learns your real peak after 3 focus sessions.'}</Text>
       <Pressable onPress={() => setMeta((m) => ({ ...m, lock: !m.lock }))} style={[s.logBtn, { alignSelf: 'flex-start', marginTop: 10 }, meta.lock && { borderColor: C.accent }]}>
         <View style={s.btnRow}><Icon n={meta.lock ? 'lock-closed' : 'lock-open-outline'} size={14} /><Text style={[s.logText, { marginLeft: 6 }]}>Peak Lock: {meta.lock ? 'ON' : 'OFF'}</Text></View>
       </Pressable>
@@ -1389,6 +3338,8 @@ function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onOpen, 
         <Text style={[s.muted, { fontSize: 12 }]}>Hours of the day you finish focus sessions</Text>
       </View>
 
+      <Heatmap activity={activity} />
+      <Pressable onPress={() => onOpen('levers')} style={s.item}><Icon n="analytics-outline" size={18} color={C.accent} style={{ marginRight: 10 }} /><Text style={s.itemText}>Leverage insights: what drives your best days</Text><Icon n="chevron-forward" size={16} color={C.muted} /></Pressable>
       <ReactionTest rt={meta.rt || []} onSave={(ms) => setMeta((mt) => ({ ...mt, rt: [...(mt.rt || []), ms].slice(-20) }))} />
       <SpanTest best={meta.span} onResult={(n) => setMeta((mt) => ({ ...mt, span: Math.max(mt.span || 0, n) }))} />
 
@@ -1400,13 +3351,14 @@ function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onOpen, 
 }
 
 /* ---------- Focus ---------- */
-function Focus({ onDone, suggest, log }) {
+function Focus({ onDone, suggest, log, skills = [] }) {
   const [mins, setMins] = useState(25);
   const [left, setLeft] = useState(25 * 60);
   const [running, setRunning] = useState(false);
   const [brk, setBrk] = useState(false);
   const [intent, setIntent] = useState('');
   const [msg, setMsg] = useState('');
+  const [skill, setSkill] = useState('');
   const endRef = useRef(0);
   useEffect(() => {
     if (!running) return;
@@ -1418,7 +3370,7 @@ function Focus({ onDone, suggest, log }) {
       setRunning(false);
       try { Vibration.vibrate([0, 400, 200, 400]); } catch (e) {}
       if (brk) { setBrk(false); setLeft(mins * 60); setMsg('Break over. Ready for the next round?'); }
-      else { onDone(mins, intent.trim()); setLeft(mins * 60); setMsg(`Session complete. +15 XP for ${mins} focused minutes.`); }
+      else { onDone(mins, intent.trim(), skill); setLeft(mins * 60); setMsg(`Session complete. +15 XP for ${mins} focused minutes.`); }
     }
   }, [left, running]);
   const pick = (m) => { if (!running) { const v = Math.max(5, Math.min(180, m)); setMins(v); setLeft(v * 60); setBrk(false); setMsg(''); } };
@@ -1441,9 +3393,19 @@ function Focus({ onDone, suggest, log }) {
         <Pressable onPress={() => pick(mins - 5)} style={s.chip}><Text style={s.chipText}>{'\u2212'}5</Text></Pressable>
         <Pressable onPress={() => pick(mins + 5)} style={s.chip}><Text style={s.chipText}>+5</Text></Pressable>
       </View>
-      <TextInput style={[s.addInput, { marginTop: 4 }]} value={intent} onChangeText={setIntent} editable={!running} placeholder="What will you work on? (optional)" placeholderTextColor={C.muted} keyboardAppearance="dark" />
+      <TextInput style={[s.addInput, { flex: 0, marginTop: 4 }]} value={intent} onChangeText={setIntent} editable={!running} placeholder="What will you work on? (optional)" placeholderTextColor={C.muted} keyboardAppearance="dark" />
       {!!suggest && !intent && !running && (
         <Pressable onPress={() => setIntent(suggest)} style={[s.chip, { alignSelf: 'flex-start', marginTop: 8 }]}><Text style={[s.chipText, { fontSize: 13 }]}>Use plan: {suggest}</Text></Pressable>
+      )}
+      {skills.length > 0 && !running && (
+        <View style={{ marginTop: 10 }}>
+          <Text style={s.muted}>Count this session toward a skill</Text>
+          <View style={[s.chipRow, { marginTop: 6 }]}>
+            {[{ id: '', name: 'None' }, ...skills].map((x) => (
+              <Pressable key={x.id || 'none'} onPress={() => setSkill(x.id)} style={[s.chip, { paddingVertical: 5 }, skill === x.id && { borderColor: C.accent, backgroundColor: C.raised }]}><Text style={[s.chipText, { fontSize: 13 }]}>{x.name}</Text></Pressable>
+            ))}
+          </View>
+        </View>
       )}
       <Text style={[s.muted, { textAlign: 'center', marginTop: 20 }]}>{brk ? 'Break' : 'Focus'}</Text>
       <Text style={[s.timer, { marginTop: 4 }]}>{pad(Math.floor(left / 60))}:{pad(left % 60)}</Text>
@@ -1561,8 +3523,9 @@ const Bubble = React.memo(({ item, isLast, acts }) => {
   );
 });
 
-function Coach({ online, hasKey, messages, thinking, mode, setMode, onSend, onOpenSettings, onClear, acts }) {
+function Coach({ online, hasKey, messages, thinking, mode, setMode, onSend, onOpenSettings, onClear, acts, draft }) {
   const [input, setInput] = useState('');
+  useEffect(() => { if (draft && draft.text) setInput(draft.text); }, [draft && draft.n]);
   const listRef = useRef(null);
   const canSend = online && !thinking && input.trim().length > 0;
   const go = (t) => { onSend(t); setInput(''); };
@@ -1725,6 +3688,11 @@ export default function App() {
   const [apiKey, setApiKey] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [backTo, setBackTo] = useState('today');
+  const [capture, setCapture] = useState(false);
+  const [coachDraft, setCoachDraft] = useState(null);
+  const awardRef = useRef({});
+  const { width: winW } = useWindowDimensions();
   const tasksRef = useRef(tasks); tasksRef.current = tasks;
   const habitsRef = useRef(habits); habitsRef.current = habits;
 
@@ -1777,7 +3745,8 @@ export default function App() {
     if (!loaded) return;
     const t = dayKey(0);
     const due = (x) => x.repeat && x.done && x.doneOn !== t && (x.repeat === 'daily' || !x.doneOn || daysBetween(x.doneOn, t) >= 7);
-    setTasks((p) => (p.some(due) ? p.map((x) => (due(x) ? { ...x, done: false, doneOn: undefined } : x)) : p));
+    if (!tasksRef.current.some(due)) return;
+    setTasks((p) => p.map((x) => (due(x) ? { ...x, done: false, doneOn: undefined } : x)));
   }, [loaded, tick]);
 
   const bdg = useMemo(() => badgeDefs(xp, focusMin, habits, cards, meta), [xp, focusMin, habits, cards, meta]);
@@ -1812,7 +3781,7 @@ export default function App() {
     else setMeta((m) => ({ ...m, slips: m.slips + 1 }));
   };
   const bump = (n) => setActivity((a) => ({ ...a, [dayKey(0)]: Math.max(0, (a[dayKey(0)] || 0) + n) }));
-  const finishFocus = (m, intent = '') => {
+  const finishFocus = (m, intent = '', skillId = '') => {
     const h = new Date(Date.now() - m * 60000).getHours();
     setXp((x) => x + 15); setFocusMin((f) => f + m); bump(1);
     setMeta((mt) => ({
@@ -1820,6 +3789,7 @@ export default function App() {
       hours: { ...mt.hours, [h]: (mt.hours[h] || 0) + 1 },
       focusDays: { ...mt.focusDays, [dayKey(0)]: ((mt.focusDays || {})[dayKey(0)] || 0) + m },
       focusLog: [...(mt.focusLog || []), { ts: Date.now(), mins: m, intent }].slice(-80),
+      ...(skillId ? { skills: (mt.skills || []).map((x) => (x.id === skillId ? { ...x, log: { ...x.log, [dayKey(0)]: ((x.log || {})[dayKey(0)] || 0) + m } } : x)) } : {}),
     }));
     setTimeout(maybeQuiz, 700);
   };
@@ -1893,6 +3863,39 @@ export default function App() {
     if (first) { setXp((x) => x + 5); bump(1); }
   };
 
+  /* Life OS helpers shared with the new screens */
+  const award = (key, amt = 5) => {
+    const k = dayKey(0), rk = `${k}|${key}`;
+    if (awardRef.current[rk] || (((meta.awarded || {})[k]) || []).includes(key)) return false;
+    awardRef.current[rk] = true;
+    setMeta((m) => ({ ...m, awarded: { ...pruneDays(m.awarded, 14), [k]: [...(((m.awarded || {})[k]) || []), key] } }));
+    setXp((x) => x + amt);
+    bump(1);
+    return true;
+  };
+  const flagTask = (id, key) => setTasks((p) => p.map((t) => (t.id === id ? { ...t, [key]: !t[key] } : t)));
+  const routineSteps = (kind) => ((meta.routines || {})[kind]) || DEFAULT_ROUTINES[kind];
+  const routineDone = (kind) => ((((meta.routines || {}).done || {})[dayKey(0)] || {})[kind]) || [];
+  const routineToggle = (kind, id) => {
+    const k = dayKey(0), cur = routineDone(kind), nx = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
+    setMeta((m) => { const r = m.routines || {}, d = r.done || {}, day = d[k] || {}; return { ...m, routines: { ...r, done: { ...pruneDays(d), [k]: { ...day, [kind]: nx } } } }; });
+    if (routineSteps(kind).every((x) => nx.includes(x.id))) award(`routine:${kind}`, 6);
+  };
+  const finishShutdown = ({ grat, ids, one }) => {
+    const forKey = new Date().getHours() < 4 ? dayKey(0) : dayKey(1);
+    setMeta((m) => ({ ...m, ivy: { for: forKey, ids, one }, shutdown: { ...pruneDays(m.shutdown, 60), [dayKey(0)]: true } }));
+    if (grat) saveJournal(grat, 'Shutdown: one thing that went well today');
+    award('shutdown', 10);
+    showToast('Shutdown complete. Tomorrow is set up.');
+  };
+  const autoPlanNow = () => {
+    const off = new Date().getHours() >= 21 ? 1 : 0, si = sleepInfo(meta);
+    const pl = autoPlan({ nowH, off, wake: meta.wake, bed: si.bedTonight, pk, tasks: tasksRef.current, habits: habitsRef.current, due: cards.filter((c) => c.due <= dayKey(off)).length });
+    if (!pl) { showToast('Not enough of the day is left to plan. Try again tomorrow morning.'); return; }
+    applyPlan(pl, dayKey(off));
+    showToast(off ? `Auto-plan saved for tomorrow (${pl.blocks.length} blocks)` : `Auto-plan applied: ${pl.blocks.length} blocks`);
+  };
+
   /* Plan blocks and plan application */
   const setBlock = (id, v) => setMeta((m) => {
     const p = (m.plans || {})[dayKey(0)];
@@ -1961,6 +3964,21 @@ export default function App() {
       `Active goals:\n${goals}`,
       pl ? `Today's plan already applied in the app: ${pl.blocks.map((b) => `${fmt(b.start)} ${b.title}${b.done ? ' (done)' : ''}`).join('; ')}` : 'No plan applied for today yet.',
     ];
+    const pr = meta.principles || {}, rl = (pr.rules || []).slice(0, 4).map((x) => x.text).join('; '), idt = (pr.identity || []).slice(0, 3).map((x) => x.text).join('; ');
+    if (rl) lines.push(`User's own rules: ${rl}.`);
+    if (idt) lines.push(`Identity the user is building: ${idt}.`);
+    const sk = (meta.skills || []).slice(0, 4).map((x) => `${x.name} ${Math.round(skillMins(x) / 60)}h of ${x.target}h`).join(', ');
+    if (sk) lines.push(`Skills in practice: ${sk}.`);
+    const pj = (meta.projects || []).filter((x) => x.steps.some((z) => !z.done)).slice(0, 3).map((x) => `${x.title} (next: ${x.steps.find((z) => !z.done).text})`).join('; ');
+    if (pj) lines.push(`Active projects: ${pj}.`);
+    const b3 = meta.big3 && meta.big3.wk === mondayKey(0) ? meta.big3.items.map((x) => `${x.text}${x.done ? ' (done)' : ''}`).join('; ') : '';
+    if (b3) lines.push(`Weekly Big 3: ${b3}.`);
+    const nut = meta.nut || {}, fd = (meta.food || []).filter((f) => keyOf(f.ts) === tk);
+    if (fd.length) lines.push(`Nutrition today: ${sum(fd.map((f) => f.cal || 0))}/${nut.cal} kcal, ${sum(fd.map((f) => f.p || 0))}/${nut.p} g protein.`);
+    const odp = (meta.people || []).filter((p) => dueIn(p) <= 0).slice(0, 3).map((p) => p.name).join(', ');
+    if (odp) lines.push(`People overdue for contact: ${odp}.`);
+    const wn = (meta.winsV || []).slice(0, 2).map((x) => x.text).join('; ');
+    if (wn) lines.push(`Recent wins to remind the user of when they doubt themselves: ${wn}.`);
     if (isPlan) lines.push(planRules(off ? 'tomorrow' : 'today', dayKey(off), now, off, si.bedTonight));
     return lines.join('\n');
   };
@@ -2063,14 +4081,22 @@ export default function App() {
   const focusLog = (meta.focusLog || []).filter((e) => keyOf(e.ts) === dayKey(0));
   const acts = { del: deleteMsg, addTasks: addReplyTasks, regen, undoPlan, today: () => setTab('today') };
 
-  const SUBS = ['sleep', 'journal', 'goals', 'badges', 'review'];
   const view = meta.lock && inPeak && !override && ['habits', 'coach', 'me', 'learn'].includes(tab) ? 'gate' : tab;
-  const hl = SUBS.includes(tab) ? 'today' : tab;
-  const back = () => setTab('today');
+  const hl = SUB_IDS.includes(tab) ? 'today' : tab;
+  const go = (id) => { if (SUB_IDS.includes(id)) setBackTo(id === 'hub' ? 'today' : tab === 'hub' ? 'hub' : SUB_IDS.includes(tab) ? backTo : 'today'); setTab(id); };
+  const back = () => setTab(backTo);
+  const openDraft = (text) => { setMode('all'); setCoachDraft({ text, n: Date.now() }); setTab('coach'); };
   const analyze = (t) => { setMode('all'); setTab('coach'); send(t); };
   const TABS = [{ id: 'today', icon: 'checkmark-circle', label: 'Today' }, { id: 'habits', icon: 'flame', label: 'Habits' }, { id: 'focus', icon: 'timer', label: 'Focus' }, { id: 'learn', icon: 'albums', label: 'Learn' }, { id: 'dump', icon: 'create', label: 'Dump' }, { id: 'stats', icon: 'stats-chart', label: 'Stats' }, { id: 'coach', icon: 'chatbubble-ellipses', label: 'Coach' }, { id: 'me', icon: 'person', label: 'Me' }];
 
+  const ctx = {
+    meta, setMeta, tasks, habits, cards, activity, xp, profile, memory, online, thinking, apiKey, pk, plan, tick, backTo, go, award,
+    toast: showToast, analyze, draft: openDraft, setXp, bump, addTask, deleteTask, starTask, flagTask, toggleTask, addHabit, saveJournal,
+    routineToggle, routineSteps, routineDone, finishShutdown, autoPlanNow, capture: () => setCapture(true),
+  };
+
   return (
+    <AppCtx.Provider value={ctx}>
     <SafeAreaProvider>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <SafeAreaView style={s.safe} edges={['top', 'left', 'right', 'bottom']}>
@@ -2080,9 +4106,10 @@ export default function App() {
           <Logo />
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
             {online && (
-              <View style={s.badge}><View style={s.badgeDot} /><Text style={s.badgeText}>Online</Text></View>
+              <View style={[s.badge, winW < 440 && { paddingHorizontal: 8 }]}><View style={s.badgeDot} />{winW >= 440 && <Text style={s.badgeText}>Online</Text>}</View>
             )}
-            <Pressable onPress={() => setShowSettings(true)} style={s.gear} accessibilityLabel="Settings"><Icon n="settings-outline" size={22} color={C.muted} /></Pressable>
+            <Pressable onPress={() => go('hub')} style={[s.gear, { marginLeft: 6 }]} accessibilityLabel="All tools"><Icon n="apps-outline" size={22} color={C.muted} /></Pressable>
+            <Pressable onPress={() => setShowSettings(true)} style={[s.gear, { marginLeft: 6 }]} accessibilityLabel="Settings"><Icon n="settings-outline" size={22} color={C.muted} /></Pressable>
           </View>
         </View>
 
@@ -2090,25 +4117,26 @@ export default function App() {
           {view === 'gate' && <Gate end={fmt(pk.end)} onFocus={() => setTab('focus')} onOverride={() => setShield('override')} />}
           {view === 'learn' && <Learn cards={cards} setCards={setCards} online={online} apiKey={apiKey} onOpenSettings={() => setShowSettings(true)} onReview={() => { lastQuiz.current = 0; maybeQuiz(); }} />}
           {view === 'dump' && <Dump meta={meta} onDump={dump} />}
-          {view === 'stats' && <Stats tasks={tasks} habits={habits} activity={activity} cards={cards} meta={meta} setMeta={setMeta} online={online} onOpen={setTab} onAnalyze={analyze} />}
+          {view === 'stats' && <Stats tasks={tasks} habits={habits} activity={activity} cards={cards} meta={meta} setMeta={setMeta} online={online} onOpen={go} onAnalyze={analyze} />}
           {view === 'today' && (
             <Today name={(profile.name || '').trim()} tasks={tasks} habits={habits} xp={xp} online={online} busy={thinking} activity={activity} focusMin={focusMin}
               meta={meta} setMeta={setMeta} pk={pk} inPeak={inPeak} plan={plan} tomorrowPlan={tomorrowPlan} score={score} nudgeList={nudgeList}
-              onOpen={setTab} onUrge={() => setShield('urge')} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} onPlan={planNow}
+              onOpen={go} onUrge={() => setShield('urge')} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} onPlan={planNow}
               onStar={starTask} onRepeat={cycleRepeat} onClearDone={clearDone} onToggleBlock={toggleBlock} onClearPlan={clearPlan} onWater={changeWater} />
           )}
           {view === 'habits' && <Habits habits={habits} onToggle={toggleHabit} onAdd={addHabit} onDelete={deleteHabit} />}
-          {view === 'focus' && <Focus onDone={finishFocus} suggest={nextBlock ? nextBlock.title : ''} log={focusLog} />}
+          {view === 'focus' && <Focus onDone={finishFocus} suggest={nextBlock ? nextBlock.title : ''} log={focusLog} skills={meta.skills || []} />}
           {view === 'me' && <Me profile={profile} setProfile={setProfile} memory={memory} setMemory={setMemory} />}
           {view === 'coach' && (
             <Coach online={online} hasKey={!!apiKey} messages={messages} thinking={thinking} mode={mode} setMode={setMode}
-              onSend={send} onOpenSettings={() => setShowSettings(true)} onClear={requestClear} acts={acts} />
+              onSend={send} onOpenSettings={() => setShowSettings(true)} onClear={requestClear} acts={acts} draft={coachDraft} />
           )}
           {view === 'sleep' && <Sleep meta={meta} setMeta={setMeta} activity={activity} onBack={back} />}
           {view === 'journal' && <Journal meta={meta} setMeta={setMeta} onSave={saveJournal} onBack={back} />}
           {view === 'goals' && <Goals meta={meta} setMeta={setMeta} onXp={(d) => setXp((x) => Math.max(0, x + d))} onBack={back} />}
           {view === 'badges' && <Badges list={bdg} onBack={back} />}
           {view === 'review' && <Review habits={habits} activity={activity} meta={meta} online={online} onBack={back} onAnalyze={analyze} />}
+          {SCREEN_MAP[view] ? React.createElement(SCREEN_MAP[view]) : null}
         </KeyboardAvoidingView>
 
         <View style={s.tabBar}>
@@ -2125,9 +4153,12 @@ export default function App() {
         <SettingsModal visible={showSettings} apiKey={apiKey} meta={meta} setMeta={setMeta} onSave={saveKey} onExport={exportData} onImport={importData}
           onClear={() => { setShowSettings(false); setTimeout(requestClear, 350); }} onClose={() => setShowSettings(false)} />
         <Confirm c={confirm} onNo={() => setConfirm(null)} />
+        <QuickCapture visible={capture} onClose={() => setCapture(false)} />
+        {!['coach', 'focus', 'gate'].includes(view) && !capture && <Fab onPress={() => setCapture(true)} />}
         <Toast toast={toast} onUndo={() => { const f = toast && toast.undo; setToast(null); if (f) f(); }} onClose={() => setToast(null)} />
       </SafeAreaView>
     </SafeAreaProvider>
+    </AppCtx.Provider>
   );
 }
 
@@ -2146,7 +4177,7 @@ const s = StyleSheet.create({
   gear: { marginLeft: 12, width: 36, height: 36, alignItems: 'center', justifyContent: 'center' },
   gearText: { color: C.muted, fontSize: 22 },
 
-  page: { width: '100%', maxWidth: MAX_W, alignSelf: 'center', padding: 20, paddingBottom: 40 },
+  page: { width: '100%', maxWidth: MAX_W, alignSelf: 'center', padding: 20, paddingBottom: 96 },
   h1: { color: C.text, fontSize: 26, fontWeight: '800', letterSpacing: -0.8 },
   rank: { color: C.muted, fontSize: 15, fontWeight: '600' },
   section: { color: C.text, fontSize: 20, fontWeight: '700', marginTop: 24, marginBottom: 12 },
@@ -2246,4 +4277,6 @@ const s = StyleSheet.create({
   toastWrap: { position: 'absolute', left: 16, right: 16, alignItems: 'center' },
   toast: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#1C1C20', borderWidth: 1, borderColor: C.border, borderRadius: 14, paddingHorizontal: 16, paddingVertical: 12, width: '100%', maxWidth: 520, elevation: 8 },
   toastBtn: { color: '#60A5FA', fontWeight: '700', fontSize: 14, marginLeft: 12 },
+  hubCard: { width: '48%', marginRight: '2%', backgroundColor: C.surface, borderWidth: 1, borderColor: C.border, borderRadius: 14, padding: 12, marginBottom: 8 },
+  fab: { position: 'absolute', right: 18, width: 52, height: 52, borderRadius: 26, backgroundColor: C.accent, alignItems: 'center', justifyContent: 'center', elevation: 6, shadowColor: '#000', shadowOpacity: 0.4, shadowRadius: 6, shadowOffset: { width: 0, height: 3 } },
 });
