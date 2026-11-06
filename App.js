@@ -62,8 +62,10 @@ const peakWindow = (meta) => {
   const best = Object.keys(hrs).sort((a, b) => hrs[b] - hrs[a])[0];
   const sleep = sleepNow(meta) ?? 7, short = sleep < 6;
   const learned = total >= 3 && best !== undefined;
-  const start = (learned ? +best : meta.wake + 2) + (short ? 1 : 0);
-  return { start, end: start + (short ? 1.5 : 2), learned };
+  // Energy map taps are the second source: after about 10 taps they stand in for missing focus data
+  const eb = !learned ? bestEnergy(meta.energy || []) : null;
+  const start = (learned ? +best : eb ? eb.start : meta.wake + 2) + (short ? 1 : 0);
+  return { start, end: start + (short ? 1.5 : 2), learned: learned || !!eb, src: learned ? 'focus' : eb ? 'energy' : 'default' };
 };
 const parseDump = (raw) => {
   const out = { actions: [], models: [], archive: [] };
@@ -246,6 +248,13 @@ const nudges = ({ meta, habits, cards, plan, pk, inPeak, online, limit = 2 }) =>
   else if (past <= 3) out.push({ icon: 'moon', text: `Past your ${fmt(si.bedTonight)} bedtime. Sleep now: tomorrow's output depends on it.`, go: 'sleep' });
   if (inPeak) out.push({ icon: 'flash', text: `You are in your peak window until ${fmt(pk.end)}. Do the hardest task now.`, go: 'focus' });
   else if (pk.start > now && pk.start - now <= 0.5) out.push({ icon: 'flash-outline', text: `Peak window starts in ${Math.round((pk.start - now) * 60)} min. Line up your hardest task.`, go: 'focus' });
+  // Cross-tool links: what one tool logs changes what the others recommend
+  const slept = (meta.sleep || {})[t], trained = (meta.workouts || []).some((w) => keyOf(w.ts) === t);
+  if (slept != null && slept < 6 && !trained && now < 20) out.push({ icon: 'bed-outline', text: `Short night (${hm(slept)}). Keep training light and protect your peak window.`, go: 'workout' });
+  const protein = sum((meta.food || []).filter((f) => keyOf(f.ts) === t).map((f) => f.p || 0)), ptarget = (meta.nut || {}).p || 0;
+  if (trained && ptarget && protein < ptarget / 2 && now >= 15) out.push({ icon: 'nutrition-outline', text: `You trained today and protein is at ${Math.round(protein)} of ${ptarget} g. Feed the recovery.`, go: 'nutrition' });
+  const moodNow = (meta.mood || {})[t];
+  if (moodNow && (moodNow.e <= 2 || moodNow.m <= 2) && !((meta.calm || {})[t] > 0)) out.push({ icon: 'leaf-outline', text: 'Energy or mood is low. Two minutes of slow breathing first, then one small win.', go: 'breathe' });
   const cur = plan && plan.blocks.find((b) => !b.done && b.start <= now && now < b.end);
   if (cur) out.push({ icon: 'time-outline', text: `Now: ${cur.title} (until ${fmt(cur.end)})`, go: 'focus' });
   if (!plan && online && now < 20) out.push({ icon: 'sparkles-outline', text: 'No plan for today yet. Let Coach build one and apply it here.', go: 'plan' });
@@ -315,7 +324,7 @@ const DEFAULT_META = {
   wake: 7, lock: false, sleep: {}, sleepLog: {}, sleepStart: null, sleepTarget: 8, hours: {}, urges: 0, slips: 0,
   models: [], archive: [], focusDays: {}, focusLog: [], reviews: { ok: 0, n: 0 }, mood: {}, rt: [], span: 0,
   plans: {}, water: {}, waterGoal: 8, journal: [], goals: [], badges: [], chatKeep: 60,
-  unit: 'kg', nut: { cal: 2200, p: 140 }, cur: '$', budget: 0, favs: ['sleep', 'journal', 'goals', 'review'], awarded: {}, peakOverride: null,
+  unit: 'kg', nut: { cal: 2200, p: 140 }, cur: '$', budget: 0, awarded: {}, peakOverride: null,
 };
 
 /* ---------- Life OS: shared context, helpers, data libraries ---------- */
@@ -607,10 +616,7 @@ const REG = [
   { id: 'bucket', g: 'Growth', icon: 'checkbox-outline', name: 'Bucket list', desc: 'Things you will not skip' },
   { id: 'badges', g: 'Growth', icon: 'ribbon-outline', name: 'Badges', desc: 'Unlocked from real activity' },
 ];
-const HUB_GROUPS = ['Body', 'Brain', 'Execute', 'Intelligence', 'Money', 'Growth'];
 const regOf = (id) => REG.find((r) => r.id === id);
-const SHORT = { workout: 'Workouts', body: 'Body', fasting: 'Fasting', breathe: 'Breathe', meditate: 'Meditate', math: 'Math', stroop: 'Stroop', speed: 'Speed read', decisions: 'Decisions', decide: 'Matrix', priority: 'Priorities', big3: 'Big 3', timetrack: 'Time', shutdown: 'Shutdown', anti: 'Bad habits', briefing: 'Briefing', levers: 'Levers', search: 'Search', review: 'Review', retro: 'Retro', networth: 'Net worth', calc: 'Calculators', lifeweeks: 'Life weeks', wheel: 'Life wheel' };
-const shortOf = (r) => SHORT[r.id] || r.name;
 
 /* ---------- Small UI kit for the new screens ---------- */
 function Inp({ value, onChange, ph, num: isNum, multi, onSubmit, style, editable }) {
@@ -838,11 +844,12 @@ function Screen({ title, sub, onBack, children }) {
   return (
     <ScrollView contentContainerStyle={s.page} keyboardShouldPersistTaps="handled">
       <Pressable onPress={onBack || (() => A.go(A.backTo || 'today'))} hitSlop={10} style={[s.btnRow, { alignSelf: 'flex-start', marginBottom: 8 }]}>
-        <Icon n="chevron-back" size={18} color={C.muted} /><Text style={[s.muted, { marginLeft: 2 }]}>{A.backTo === 'hub' ? 'Hub' : 'Today'}</Text>
+        <Icon n="chevron-back" size={18} color={C.muted} /><Text style={[s.muted, { marginLeft: 2 }]}>{TAB_NAME[A.backTo] || 'Today'}</Text>
       </Pressable>
       <Text style={s.h1}>{title}</Text>
       {!!sub && <Text style={[s.muted, { marginTop: 4, marginBottom: 12 }]}>{sub}</Text>}
       {children}
+      <Links id={A.tool} />
     </ScrollView>
   );
 }
@@ -2231,32 +2238,7 @@ function SearchAll() {
       {groups.map(([name, go, list]) => (
         <View key={name}>
           <Text style={s.section}>{name} ({list.length})</Text>
-          {list.slice(0, 6).map((txt, i) => <Pressable key={i} onPress={() => A.go(go || (REG.find((r) => r.name === txt) || {}).id || 'hub')} style={s.item}><Text style={s.itemText} numberOfLines={2}>{txt}</Text><Icon n="chevron-forward" size={16} color={C.muted} /></Pressable>)}
-        </View>
-      ))}
-    </Screen>
-  );
-}
-
-function Hub() {
-  const A = useApp();
-  const favs = A.meta.favs || [];
-  const toggleFav = (id) => A.setMeta((m) => { const f = m.favs || []; return { ...m, favs: f.includes(id) ? f.filter((x) => x !== id) : f.length >= 4 ? f : [...f, id] }; });
-  return (
-    <Screen title="All tools" sub="Star up to 4 tools to pin them on Today." onBack={undefined}>
-      <Pressable onPress={() => A.go('search')} style={[s.item, { marginBottom: 4 }]}><Icon n="search-outline" size={18} color={C.muted} style={{ marginRight: 10 }} /><Text style={[s.itemText, { color: C.muted }]}>Search everything</Text></Pressable>
-      {HUB_GROUPS.map((g) => (
-        <View key={g}>
-          <Text style={s.section}>{g}</Text>
-          <View style={s.chipRow}>
-            {REG.filter((r) => r.g === g).map((r) => (
-              <Pressable key={r.id} onPress={() => A.go(r.id)} style={s.hubCard}>
-                <View style={s.between}><Icon n={r.icon} size={22} color={C.accent} /><Pressable onPress={() => toggleFav(r.id)} hitSlop={8}><Icon n={favs.includes(r.id) ? 'star' : 'star-outline'} size={17} color={favs.includes(r.id) ? '#FBBF24' : C.muted} /></Pressable></View>
-                <Text style={[s.habitTitle, { flex: 0, fontSize: 15, marginTop: 8 }]}>{r.name}</Text>
-                <Text style={[s.muted, { fontSize: 12, lineHeight: 16 }]}>{r.desc}</Text>
-              </Pressable>
-            ))}
-          </View>
+          {list.slice(0, 6).map((txt, i) => <Pressable key={i} onPress={() => A.go(go || (REG.find((r) => r.name === txt) || {}).id || 'search')} style={s.item}><Text style={s.itemText} numberOfLines={2}>{txt}</Text><Icon n="chevron-forward" size={16} color={C.muted} /></Pressable>)}
         </View>
       ))}
     </Screen>
@@ -2719,9 +2701,389 @@ const SCREEN_MAP = {
   priority: PriorityMatrix, big3: Big3, projects: Projects, routines: Routines, timetrack: TimeTracker, energy: EnergyMap, shutdown: Shutdown, anti: AntiHabits, countdowns: Countdowns,
   briefing: Briefing, levers: Levers, playbooks: Playbooks, search: SearchAll, retro: Retro,
   expenses: Expenses, subs: Subs, networth: NetWorth, calc: Calc,
-  skills: Skills, people: People, principles: Principles, wins: Wins, wheel: LifeWheel, lifeweeks: LifeWeeks, bucket: Bucket, hub: Hub,
+  skills: Skills, people: People, principles: Principles, wins: Wins, wheel: LifeWheel, lifeweeks: LifeWeeks, bucket: Bucket,
 };
 const SUB_IDS = ['sleep', 'journal', 'goals', 'badges', 'review', ...Object.keys(SCREEN_MAP)];
+
+/* ---------- Life graph: every tool lives inside a feature and is wired to the others ----------
+   Each tool has ONE home feature (a tab). The home tab shows it as a live row, ordered by what needs you first.
+   EDGES lists only links that really exist in the code (data that one tool writes and another reads). */
+const HOME = {
+  // Habits: body and calm
+  sleep: 'habits', workout: 'habits', nutrition: 'habits', body: 'habits', fasting: 'habits', breathe: 'habits', meditate: 'habits', anti: 'habits',
+  // Today: run the day
+  briefing: 'today', priority: 'today', big3: 'today', routines: 'today', shutdown: 'today', countdowns: 'today', goals: 'today',
+  // Focus: work, skill and money
+  timetrack: 'focus', energy: 'focus', projects: 'focus', skills: 'focus', math: 'focus', stroop: 'focus', expenses: 'focus', subs: 'focus', networth: 'focus', calc: 'focus',
+  // Learn: think and learn
+  books: 'learn', speed: 'learn', models: 'learn', decisions: 'learn', decide: 'learn', premortem: 'learn',
+  // Dump: capture
+  notes: 'dump',
+  // Stats: see the whole system
+  levers: 'stats', review: 'stats', retro: 'stats', wheel: 'stats', lifeweeks: 'stats', search: 'stats',
+  // Coach
+  playbooks: 'coach',
+  // Me: identity and people
+  journal: 'me', principles: 'me', wins: 'me', people: 'me', bucket: 'me', badges: 'me',
+};
+const TAB_NAME = { today: 'Today', habits: 'Habits', focus: 'Focus', learn: 'Learn', dump: 'Dump', stats: 'Stats', coach: 'Coach', me: 'Me' };
+const HOSTS = {
+  today: { title: 'Run the day', sub: 'Plan, priorities and shutdown feed each other.' },
+  habits: { title: 'Body and calm', sub: 'What you log here shapes your plan, your peak window and your habits.' },
+  focus: { title: 'Work, skill and money', sub: 'Time, energy and spending, tied to your focus sessions.' },
+  learn: { title: 'Think and learn', sub: 'Reading, models and decisions that feed your goals.' },
+  dump: { title: 'Second brain', sub: 'Everything you capture stays searchable.' },
+  stats: { title: 'See the whole system', sub: 'The tools that read all your other data.' },
+  me: { title: 'Identity and people', sub: 'Your rules, wins and relationships. Coach reads them all.' },
+};
+Object.keys(HOSTS).forEach((k) => { HOSTS[k].tools = REG.map((r) => r.id).filter((id) => HOME[id] === k); });
+
+// Non-tool nodes that a connection can point at
+const NODES = {
+  focus: { name: 'Focus timer', go: 'focus' }, habits: { name: 'Habits', go: 'habits' }, today: { name: 'Today', go: 'today' },
+  peak: { name: 'Peak window', go: 'today' }, score: { name: 'Day score', go: 'today' }, coach: { name: 'Coach', go: 'coach' },
+};
+const nodeOf = (id) => NODES[id] || (regOf(id) ? { name: regOf(id).name, go: id } : null);
+
+const EDGES = [
+  ['sleep', 'peak', 'a short night pushes your peak window later and shorter'],
+  ['sleep', 'workout', 'a night under 6 hours makes Today suggest lighter training'],
+  ['sleep', 'habits', 'a full night checks your sleep habit'],
+  ['sleep', 'coach', 'Coach plans around your sleep debt'],
+  ['sleep', 'levers', 'tested against your best days'],
+  ['energy', 'peak', 'stands in for your peak window until focus sessions teach it'],
+  ['focus', 'peak', 'finish times teach your peak window'],
+  ['focus', 'skills', 'sessions log practice minutes to a skill'],
+  ['focus', 'timetrack', 'sessions are added to your time log'],
+  ['focus', 'habits', 'enough deep focus checks your focus habit'],
+  ['focus', 'score', 'counts toward your day score'],
+  ['workout', 'habits', 'a logged set checks your training habit'],
+  ['workout', 'nutrition', 'a training day raises the protein reminder'],
+  ['workout', 'levers', 'tested against your best days'],
+  ['nutrition', 'habits', 'hitting your protein checks your protein habit'],
+  ['nutrition', 'coach', 'Coach sees your calories and protein'],
+  ['nutrition', 'levers', 'your protein target is tested against your best days'],
+  ['breathe', 'habits', 'calm minutes check your calm habit'],
+  ['breathe', 'levers', 'tested against your best days'],
+  ['meditate', 'habits', 'calm minutes check your calm habit'],
+  ['meditate', 'levers', 'tested against your best days'],
+  ['stroop', 'focus', 'a one-minute warm-up before deep work'],
+  ['math', 'focus', 'a one-minute warm-up before deep work'],
+  ['journal', 'habits', 'an entry checks your journal habit'],
+  ['journal', 'levers', 'tested against your best days'],
+  ['shutdown', 'today', "sets tomorrow's one thing and list on Today"],
+  ['shutdown', 'habits', 'finishing it checks your shutdown habit'],
+  ['routines', 'today', 'your steps show on Today'],
+  ['routines', 'habits', 'finishing the morning routine checks its habit'],
+  ['routines', 'levers', 'your morning routine is tested against your best days'],
+  ['big3', 'today', 'pinned on Today'],
+  ['big3', 'coach', 'Coach sees your weekly outcomes'],
+  ['goals', 'coach', 'Coach plans toward your goals'],
+  ['projects', 'coach', 'Coach sees your next actions'],
+  ['skills', 'coach', 'Coach sees your practice hours'],
+  ['principles', 'coach', 'Coach uses your rules and identity'],
+  ['wins', 'coach', 'Coach quotes them when you doubt yourself'],
+  ['people', 'today', 'overdue contacts and birthdays become nudges'],
+  ['people', 'coach', 'Coach sees who is overdue'],
+  ['decisions', 'today', 'reviews that are due become nudges'],
+  ['countdowns', 'today', 'close deadlines pin to Today'],
+  ['expenses', 'today', 'going over budget becomes a nudge'],
+  ['fasting', 'today', 'reaching your goal becomes a nudge'],
+  ['levers', 'habits', 'turn a proven lever into a habit in one tap'],
+  ['playbooks', 'coach', 'prompts that carry your real data into Coach'],
+  ['notes', 'search', 'searchable from one box'],
+  ['journal', 'search', 'searchable from one box'],
+  ['books', 'search', 'searchable from one box'],
+  ['decisions', 'search', 'searchable from one box'],
+  ['goals', 'search', 'searchable from one box'],
+  ['projects', 'search', 'searchable from one box'],
+  ['people', 'search', 'searchable from one box'],
+  ['wins', 'search', 'searchable from one box'],
+  ['expenses', 'search', 'searchable from one box'],
+  ['principles', 'search', 'searchable from one box'],
+  ['sleep', 'badges', 'real activity here unlocks badges'],
+  ['workout', 'badges', 'real activity here unlocks badges'],
+  ['breathe', 'badges', 'real activity here unlocks badges'],
+  ['meditate', 'badges', 'real activity here unlocks badges'],
+  ['journal', 'badges', 'real activity here unlocks badges'],
+  ['books', 'badges', 'real activity here unlocks badges'],
+  ['skills', 'badges', 'real activity here unlocks badges'],
+  ['decisions', 'badges', 'real activity here unlocks badges'],
+  ['notes', 'badges', 'real activity here unlocks badges'],
+  ['models', 'badges', 'real activity here unlocks badges'],
+  ['people', 'badges', 'real activity here unlocks badges'],
+  ['shutdown', 'badges', 'real activity here unlocks badges'],
+  ['timetrack', 'badges', 'real activity here unlocks badges'],
+  ['anti', 'badges', 'real activity here unlocks badges'],
+  ['goals', 'badges', 'real activity here unlocks badges'],
+  ['big3', 'briefing', 'your weekly outcomes lead the briefing'],
+  ['decisions', 'briefing', 'reviews that are due appear in it'],
+  ['shutdown', 'briefing', "tomorrow's one thing appears in it"],
+];
+
+/* Habits that check themselves: when a tool records the real thing, the matching habit is ticked once per day.
+   Unticking is respected because each habit is only auto-ticked once a day. */
+const minsIn = (title, d = 1) => { const m = /(\d+)\s*(?:min|minute)/i.exec(title); return m ? +m[1] : d; };
+const AUTO = [
+  { id: 'train', why: 'workout logged', cats: ['body'], re: /\b(train|workout|work out|gym|lift|lifting|exercise|cardio)\b/i, hit: (m, t) => (m.workouts || []).some((w) => keyOf(w.ts) === t) },
+  { id: 'calm', why: 'calm practice logged', re: /\b(meditat\w*|breath\w*|mindful\w*)/i, hit: (m, t, h) => ((m.calm || {})[t] || 0) >= minsIn(h.title) },
+  { id: 'journal', why: 'journal entry saved', re: /\b(journal\w*|gratitude)\b/i, hit: (m, t) => (m.journal || []).some((j) => j.date === t) },
+  { id: 'sleep', why: 'sleep goal reached', re: /\bsleep\b.*\b(hours?|hrs?)\b|\b(hours?|hrs?)\b.*\bsleep\b/i, hit: (m, t) => ((m.sleep || {})[t] || 0) >= (m.sleepTarget || 8) },
+  { id: 'water', why: 'water goal reached', re: /\b(water|hydrat\w*)/i, hit: (m, t) => ((m.water || {})[t] || 0) >= (m.waterGoal || 8) },
+  { id: 'focus', why: 'deep focus done', re: /\b(focus|deep work)\b/i, hit: (m, t, h) => ((m.focusDays || {})[t] || 0) >= minsIn(h.title, 20) },
+  { id: 'protein', why: 'protein target hit', re: /\bprotein\b/i, hit: (m, t) => { const p = (m.nut || {}).p; return !!p && sum((m.food || []).filter((f) => keyOf(f.ts) === t).map((f) => f.p || 0)) >= p; } },
+  { id: 'plan', why: 'plan made', re: /\bplan (my|the|your)? ?day\b/i, hit: (m, t) => !!(m.plans || {})[t] },
+  { id: 'shutdown', why: 'shutdown done', re: /\b(shut ?down|plan tomorrow)\b/i, hit: (m, t) => !!(m.shutdown || {})[t] },
+  { id: 'morning', why: 'morning routine done', re: /\bmorning routine\b/i, hit: (m, t) => { const st = (m.routines || {}).morning || DEFAULT_ROUTINES.morning, dn = ((((m.routines || {}).done || {})[t]) || {}).morning || []; return st.length > 0 && st.every((x) => dn.includes(x.id)); } },
+];
+const autoFor = (h) => AUTO.find((a) => a.re.test(h.title) && (!a.cats || a.cats.includes(h.cat)));
+
+/* Live one-line status for every tool, built from the same data the tools write */
+const statusOf = (id, A) => {
+  const m = A.meta, t = dayKey(0), hr = new Date().getHours(), cur = m.cur || '$';
+  const mine = (list, f = 'ts') => (list || []).filter((x) => keyOf(x[f]) === t);
+  const ok = (text, attn = 0) => ({ text, attn });
+  switch (id) {
+    case 'sleep': {
+      const si = sleepInfo(m);
+      if (m.sleepStart) return ok('Timer running. Open it when you wake up', 2);
+      if (si.last == null) return ok(hr < 14 ? "Log last night's sleep" : 'Not logged today', hr >= 6 && hr < 14 ? 2 : 0);
+      return ok(`${hm(si.last)} last night${si.debt > 0.5 ? `, ${r1(si.debt)}h debt this week` : ''}`, si.last < 6 ? 1 : 0);
+    }
+    case 'workout': {
+      const w = mine(m.workouts), wk = new Set((m.workouts || []).filter((x) => keyOf(x.ts) >= dayKey(-6)).map((x) => keyOf(x.ts))).size;
+      return ok(w.length ? `${w.length} set${w.length > 1 ? 's' : ''} today` : `${wk} training day${wk === 1 ? '' : 's'} in the last 7`);
+    }
+    case 'nutrition': {
+      const f = mine(m.food), n = m.nut || {};
+      return ok(f.length ? `${Math.round(sum(f.map((x) => x.cal || 0)))} of ${n.cal} kcal, ${Math.round(sum(f.map((x) => x.p || 0)))} of ${n.p} g protein` : `Nothing logged. Target ${n.cal || 2200} kcal, ${n.p || 140} g protein`, !f.length && hr >= 14 ? 1 : 0);
+    }
+    case 'body': {
+      const b = m.body || {}, ks = Object.keys(b).filter((k) => b[k].w > 0).sort(), l = ks[ks.length - 1];
+      return ok(l ? `${r1(b[l].w)} ${m.unit || 'kg'} on ${dLabel(l)}` : 'Log your weight to see the trend');
+    }
+    case 'fasting': {
+      const f = m.fast;
+      if (f && f.start) { const h = (Date.now() - f.start) / 36e5; return ok(`${r1(h)}h of ${f.goal || 16}h`, h >= (f.goal || 16) ? 2 : 0); }
+      return ok('Not fasting');
+    }
+    case 'breathe': case 'meditate': {
+      const c = (m.calm || {})[t] || 0, mo = (m.mood || {})[t];
+      return ok(c ? `${r1(c)} min of calm today` : 'No calm practice yet today', !c && mo && (mo.e <= 2 || mo.m <= 2) ? 1 : 0);
+    }
+    case 'anti': {
+      const a = m.anti || [];
+      if (!a.length) return ok('Track what you refuse to do');
+      const best = Math.max(0, ...a.map((x) => daysBetween((x.slips || []).slice().sort().pop() || x.start, t)));
+      return ok(`${a.length} tracked, longest clean run ${best} day${best === 1 ? '' : 's'}`);
+    }
+    case 'math': case 'stroop': return ok('A one-minute warm-up that sharpens attention before deep work');
+    case 'books': {
+      const open = (m.books || []).filter((x) => !x.done);
+      return ok(open.length ? `${open[0].title}: page ${open[0].page} of ${open[0].pages}` : `${(m.books || []).filter((x) => x.done).length} finished`);
+    }
+    case 'notes': return ok(`${(m.notes || []).length} notes captured`);
+    case 'models': return ok(`${Object.keys(m.mmApplied || {}).length} of ${MODELS.length} applied`);
+    case 'decisions': {
+      const d = m.decisions || [], due = d.filter((x) => !x.outcome && x.review <= t).length, c = calib(d);
+      return ok(due ? `${due} ready to review` : c ? `Calibration ${c.rate}% right across ${c.n}` : 'Log a call, review it later', due ? 1 : 0);
+    }
+    case 'premortem': return ok(`${(m.premortems || []).length} run`);
+    case 'priority': { const o = A.tasks.filter((x) => !x.done); return ok(`${o.length} open, ${o.filter((x) => x.star).length} starred`); }
+    case 'big3': {
+      const b = m.big3 && m.big3.wk === mondayKey(0) ? m.big3.items : [];
+      return ok(b.length ? `${b.filter((x) => x.done).length} of ${b.length} done this week` : 'Set three outcomes for the week', b.length ? 0 : 1);
+    }
+    case 'projects': {
+      const p = (m.projects || []).filter((x) => (x.steps || []).some((z) => !z.done)), st = p.filter((x) => daysBetween(keyOf(x.touched), t) >= 7).length;
+      return ok(p.length ? `${p.length} active${st ? `, ${st} stalled` : ''}` : 'Give every outcome a next action', st ? 1 : 0);
+    }
+    case 'routines': {
+      const kind = hr < 15 ? 'morning' : 'evening', st = A.routineSteps(kind), dn = A.routineDone(kind);
+      return ok(`${kind === 'morning' ? 'Morning' : 'Evening'}: ${dn.length} of ${st.length} steps`, kind === 'morning' && hr >= 7 && dn.length < st.length ? 1 : 0);
+    }
+    case 'timetrack': {
+      if (m.timer) return ok(`Tracking ${m.timer.label}`, 1);
+      const tl = mine(m.timeLog, 'end');
+      return ok(tl.length ? `${r1(sum(tl.map((x) => x.mins)))} min tracked today` : 'See where your hours go');
+    }
+    case 'energy': {
+      const e = m.energy || [], b = bestEnergy(e);
+      return ok(b ? `Best hours ${fmt(b.start)} to ${fmt(b.end)}` : `${e.length} of 10 taps to find your peak`);
+    }
+    case 'shutdown': { const d = !!(m.shutdown || {})[t]; return ok(d ? 'Done. Tomorrow is set' : 'Set tomorrow up tonight', !d && hr >= 20 ? 2 : 0); }
+    case 'countdowns': {
+      const c = (m.countdowns || []).map((x) => ({ x, n: daysUntil(x.date) })).filter((o) => o.n >= 0).sort((a, b) => a.n - b.n)[0];
+      return ok(c ? `${c.x.title} ${c.n === 0 ? 'is today' : `in ${c.n} day${c.n > 1 ? 's' : ''}`}` : 'Deadlines and events', c && c.n <= 3 ? 1 : 0);
+    }
+    case 'goals': {
+      const g = (m.goals || []).filter((x) => !x.done);
+      return ok(g.length ? `${g.length} active. ${g[0].title}: ${g[0].current} of ${g[0].target}` : 'Set a target with a number');
+    }
+    case 'briefing': return ok('Everything that matters today, in one read');
+    case 'levers': {
+      const r = leverInsights(m, A.activity, A.habits).rows;
+      return ok(r.length ? `Top lever: ${r[0].label.toLowerCase()}, +${r[0].delta} wins a day` : 'Needs about two weeks of data');
+    }
+    case 'review': return ok('Your week in numbers');
+    case 'retro': {
+      const d = (m.retros || []).some((x) => x.wk === mondayKey(0));
+      return ok(d ? 'This week is saved' : 'Look back, adjust, repeat', !d && new Date().getDay() === 0 ? 1 : 0);
+    }
+    case 'wheel': { const h = (m.wheel || {}).hist || []; return ok(h.length ? `Balance ${h[0].avg} on ${dLabel(h[0].date)}` : 'Rate 8 areas of life'); }
+    case 'lifeweeks': return ok(validDate(m.birth || '') ? `${commas(lifeStats(m.birth, m.lifeExp || 85).left)} weeks left at ${m.lifeExp || 85}` : 'Add your birthday to see it');
+    case 'search': return ok('Find any task, note or entry');
+    case 'playbooks': return ok(`${PLAYBOOKS.length} prompts, ${PLAYBOOKS.filter((p) => p.auto).length} use your data`);
+    case 'expenses': {
+      const sp = spentIn(m.expenses || [], monthKey(0)), b = m.budget || 0;
+      return ok(`${money(sp, cur)} this month${b > 0 ? ` of ${money(b, cur)}` : ''}`, b > 0 && sp > b ? 2 : 0);
+    }
+    case 'subs': { const tot = sum((m.subs || []).map((x) => subMonthly(x))); return ok(tot ? `${money(tot, cur)} a month, ${money(tot * 12, cur)} a year` : 'What you pay every month'); }
+    case 'networth': {
+      const n = m.nw || {}, v = sum((n.assets || []).map((x) => x.amt)) - sum((n.debts || []).map((x) => x.amt));
+      return ok((n.assets || []).length || (n.debts || []).length ? `Net ${money(v, cur)}` : 'Assets minus debts, tracked monthly');
+    }
+    case 'skills': { const sk = m.skills || []; return ok(sk.length ? `${r1(sum(sk.map((x) => skillMins(x))) / 60)}h across ${sk.length} skill${sk.length > 1 ? 's' : ''}` : 'Track deliberate practice hours'); }
+    case 'people': { const p = (m.people || []).filter((x) => dueIn(x) <= 0).length; return ok(p ? `${p} overdue for contact` : `${(m.people || []).length} tracked`, p ? 1 : 0); }
+    case 'principles': { const p = m.principles || {}; return ok(`${(p.rules || []).length} rules, ${(p.identity || []).length} identity statements`); }
+    case 'journal': { const w = (m.journal || []).some((x) => x.date === t); return ok(w ? 'Written today' : `${(m.journal || []).length} entries`, !w && hr >= 19 ? 1 : 0); }
+    case 'wins': return ok(`${(m.winsV || []).length} stored`);
+    case 'bucket': { const b = m.bucket || []; return ok(`${b.filter((x) => x.done).length} of ${b.length} done`); }
+    case 'badges': return ok(`${(m.badges || []).length} unlocked`);
+    default: return ok(regOf(id) ? regOf(id).desc : '');
+  }
+};
+const toolStatus = (id, A) => {
+  try { return statusOf(id, A); } catch (e) { const r = regOf(id); return { text: r ? r.desc : '', attn: 0 }; }
+};
+
+/* Cross-feature insights: each one reads data from a different tool than the tab it appears on */
+const signalsFor = (host, A) => {
+  try {
+    const m = A.meta, t = dayKey(0), out = [], pk = A.pk, si = sleepInfo(m);
+    const due = A.cards.filter((c) => c.due <= t).length;
+    const decDue = (m.decisions || []).filter((x) => !x.outcome && x.review <= t).length;
+    const ppl = (m.people || []).filter((p) => dueIn(p) <= 0).length;
+    const lever = () => leverInsights(m, A.activity, A.habits).rows[0];
+    if (host === 'habits') {
+      if (si.last != null) out.push({ icon: 'moon-outline', text: `Last night ${hm(si.last)}. Your peak window today is ${fmt(pk.start)} to ${fmt(pk.end)}.`, go: 'sleep' });
+      const edge = sleepEdge(m, A.activity);
+      if (edge !== null && Math.abs(edge) >= 0.5) out.push({ icon: 'analytics-outline', text: `On nights with 7h or more you finish ${r1(Math.abs(edge))} ${edge >= 0 ? 'more' : 'fewer'} wins a day.`, go: 'levers' });
+      const auto = A.habits.filter((h) => autoFor(h));
+      if (auto.length) out.push({ icon: 'link-outline', text: `${auto.length} habit${auto.length > 1 ? 's' : ''} ${auto.length > 1 ? 'check themselves' : 'checks itself'} when you log the real thing: ${auto.slice(0, 3).map((h) => h.title).join(', ')}.` });
+      const lv = lever();
+      if (lv && lv.delta > 0.4) out.push({ icon: 'flash-outline', text: `Your best lever: ${lv.label.toLowerCase()}, +${lv.delta} wins on those days.`, go: 'levers' });
+    } else if (host === 'today') {
+      const wait = [];
+      if (due) wait.push([`${due} flashcard${due > 1 ? 's' : ''}`, 'learn']);
+      if (decDue) wait.push([`${decDue} decision${decDue > 1 ? 's' : ''}`, 'decisions']);
+      if (ppl) wait.push([`${ppl} ${ppl > 1 ? 'people' : 'person'}`, 'people']);
+      if (wait.length) out.push({ icon: 'albums-outline', text: `Waiting on you: ${wait.map((w) => w[0]).join(', ')}.`, go: wait[0][1] });
+      const lv = lever();
+      if (lv && lv.delta > 0.4) out.push({ icon: 'flash-outline', text: `Your best lever: ${lv.label.toLowerCase()}, +${lv.delta} wins on those days.`, go: 'levers' });
+    } else if (host === 'focus') {
+      const tl = (m.timeLog || []).filter((x) => keyOf(x.end) === t), tm = r1(sum(tl.map((x) => x.mins))), fm = (m.focusDays || {})[t] || 0;
+      const src = pk.src === 'energy' ? ' from your energy taps' : pk.src === 'focus' ? ' learned from your sessions' : '';
+      out.push({ icon: 'flash-outline', text: `Peak window ${fmt(pk.start)} to ${fmt(pk.end)}${src}. Put the hardest work inside it.`, go: 'energy' });
+      if (fm || tm) out.push({ icon: 'time-outline', text: `${fm} min of deep focus and ${tm} min tracked today. Sessions land in your time log and skill hours by themselves.`, go: 'timetrack' });
+      out.push({ icon: 'sparkles-outline', text: 'Warm up first: a 60-second Stroop drill sharpens attention before deep work.', go: 'stroop' });
+      const sk = (m.skills || []).filter((x) => x.target > 0 && skillMins(x) / 60 < x.target).sort((a, b) => skillMins(b) / b.target - skillMins(a) / a.target)[0];
+      if (sk) out.push({ icon: 'school-outline', text: `${sk.name}: ${r1(skillMins(sk) / 60)}h of ${sk.target}h. Pick it as your session skill.`, go: 'skills' });
+      if ((m.budget || 0) > 0) { const left = m.budget - spentIn(m.expenses || [], monthKey(0)); out.push({ icon: 'cash-outline', text: left >= 0 ? `${money(left / daysLeftMonth(), m.cur || '$')} a day left in this month's budget.` : 'Over budget this month. Income work compounds fastest right now.', go: 'expenses' }); }
+    } else if (host === 'learn') {
+      out.push({ icon: 'flash-outline', text: `Study the hard material at ${fmt(pk.start)}, inside your peak window.`, go: 'focus' });
+      if (decDue) out.push({ icon: 'scale-outline', text: `${decDue} decision${decDue > 1 ? 's' : ''} ready for review. Close the loop to sharpen your judgment.`, go: 'decisions' });
+      const bk = (m.books || []).find((b) => !b.done && b.page > 0);
+      if (bk) out.push({ icon: 'library-outline', text: `${bk.title} is ${Math.round((100 * bk.page) / bk.pages)}% done. Twenty minutes today keeps the pace.`, go: 'books' });
+    } else if (host === 'stats') {
+      const lv = lever();
+      if (lv && lv.delta > 0.4) out.push({ icon: 'flash-outline', text: `Your best lever: ${lv.label.toLowerCase()}, +${lv.delta} wins on those days.`, go: 'levers' });
+      const cur = (m.wheel || {}).cur || {}, ks = Object.keys(cur);
+      if (ks.length) { const low = ks.sort((a, b) => cur[a] - cur[b])[0]; out.push({ icon: 'aperture-outline', text: `Your life wheel's weakest area is ${low} (${cur[low]} of 10). Add one habit that lifts it.`, go: 'wheel' }); }
+    } else if (host === 'me') {
+      if (ppl) out.push({ icon: 'people-outline', text: `${ppl} ${ppl > 1 ? 'people are' : 'person is'} overdue for contact.`, go: 'people' });
+      if ((m.winsV || []).length) out.push({ icon: 'medal-outline', text: `${(m.winsV || []).length} wins stored. Coach quotes them when you doubt yourself.`, go: 'wins' });
+      const p = m.principles || {};
+      if ((p.rules || []).length || (p.identity || []).length) out.push({ icon: 'compass-outline', text: 'Your rules and identity shape every Coach answer and appear on Today.', go: 'principles' });
+    }
+    return out.slice(0, 4);
+  } catch (e) { return []; }
+};
+
+/* Inline tools: a live section on the feature that owns them, most urgent first */
+function Shelf({ host }) {
+  const A = useApp();
+  const [all, setAll] = useState(false);
+  const cfg = HOSTS[host];
+  if (!cfg) return null;
+  const rows = cfg.tools.map((id, i) => ({ r: regOf(id), st: toolStatus(id, A), i })).filter((x) => x.r)
+    .sort((a, b) => b.st.attn - a.st.attn || a.i - b.i);
+  const shown = all ? rows : rows.slice(0, 4);
+  return (
+    <View style={{ marginBottom: 4 }}>
+      <Text style={s.section}>{cfg.title}</Text>
+      <Text style={[s.muted, { marginTop: -6, marginBottom: 10 }]}>{cfg.sub}</Text>
+      {shown.map(({ r, st }) => (
+        <Pressable key={r.id} onPress={() => A.go(r.id)} style={[s.item, st.attn > 1 && { borderColor: C.accent }]}>
+          <Icon n={r.icon} size={20} color={st.attn ? C.accent : C.muted} style={{ marginRight: 12 }} />
+          <View style={{ flex: 1 }}>
+            <Text style={[s.itemText, { fontSize: 15, flex: 0 }]}>{r.name}</Text>
+            <Text style={[s.muted, { fontSize: 12, lineHeight: 16 }]} numberOfLines={2}>{st.text}</Text>
+          </View>
+          <Icon n="chevron-forward" size={16} color={C.muted} />
+        </Pressable>
+      ))}
+      {rows.length > 4 && (
+        <Pressable onPress={() => setAll(!all)} style={{ alignSelf: 'flex-start', paddingVertical: 6 }} hitSlop={8}>
+          <Text style={s.muted}>{all ? 'Show fewer' : `${rows.length - 4} more in ${cfg.title.toLowerCase()}`}</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+/* One card per feature that shows how it ties into the rest of your data */
+function Signals({ host }) {
+  const A = useApp();
+  const list = signalsFor(host, A);
+  if (!list.length) return null;
+  return (
+    <View style={s.card}>
+      <View style={[s.btnRow, { justifyContent: 'flex-start', marginBottom: 4 }]}><Icon n="link-outline" size={16} color={C.muted} /><Text style={[s.muted, { marginLeft: 6 }]}>Connected to the rest of your life</Text></View>
+      {list.map((x, i) => (
+        <Pressable key={i} disabled={!x.go} onPress={() => A.go(x.go)} style={[s.planRow, { paddingHorizontal: 0 }]}>
+          <Icon n={x.icon} size={16} color={C.accent} style={{ marginRight: 10 }} />
+          <Text style={[s.itemText, { fontSize: 14 }]}>{x.text}</Text>
+          {!!x.go && <Icon n="chevron-forward" size={14} color={C.muted} />}
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+
+/* Footer on every tool screen: what feeds it and what it feeds */
+function Links({ id }) {
+  const A = useApp();
+  const outs = EDGES.filter((e) => e[0] === id).map(([, to, how]) => ({ n: nodeOf(to), how })).filter((x) => x.n);
+  const ins = EDGES.filter((e) => e[1] === id).map(([from, , how]) => ({ n: nodeOf(from), how })).filter((x) => x.n);
+  if (!outs.length && !ins.length) return null;
+  const row = (x, i, icon) => (
+    <Pressable key={`${icon}${i}`} onPress={() => A.go(x.n.go)} style={[s.planRow, { paddingHorizontal: 0 }]}>
+      <Icon n={icon} size={15} color={C.accent} style={{ marginRight: 10 }} />
+      <Text style={[s.itemText, { fontSize: 14 }]}><Text style={{ fontWeight: '700' }}>{x.n.name}</Text>: {x.how}</Text>
+      <Icon n="chevron-forward" size={14} color={C.muted} />
+    </Pressable>
+  );
+  return (
+    <View style={[s.card, { marginTop: 16 }]}>
+      <View style={[s.btnRow, { justifyContent: 'flex-start' }]}><Icon n="link-outline" size={16} color={C.muted} /><Text style={[s.muted, { marginLeft: 6 }]}>How this connects</Text></View>
+      {outs.length > 0 && <Text style={[s.muted, { marginTop: 8, fontSize: 12 }]}>Feeds</Text>}
+      {outs.slice(0, 4).map((x, i) => row(x, i, 'arrow-forward-outline'))}
+      {ins.length > 0 && <Text style={[s.muted, { marginTop: 8, fontSize: 12 }]}>Fed by</Text>}
+      {ins.slice(0, 4).map((x, i) => row(x, i, 'arrow-back-outline'))}
+    </View>
+  );
+}
 /* ---------- Today ---------- */
 function PlanCard({ plan, online, busy, onToggle, onClear, onReplan }) {
   const d = new Date(), now = d.getHours() + d.getMinutes() / 60;
@@ -2770,7 +3132,6 @@ function Today({
     return { c, total: ts.length + hs.length, done: ts.filter((t) => t.done).length + hs.filter((h) => h.log.includes(today)).length };
   });
   const water = (meta.water || {})[today] || 0, wg = meta.waterGoal || 8;
-  const favs = (meta.favs && meta.favs.length ? meta.favs : ['sleep', 'journal', 'goals', 'review']).map(regOf).filter(Boolean).slice(0, 4);
   const hello = hr < 5 ? 'Still up' : hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
   const go = (g) => (g === 'plan' ? onPlan() : g ? onOpen(g) : null);
   const scoreColor = score.score >= 70 ? C.online : score.score >= 40 ? '#FBBF24' : '#F87171';
@@ -2798,11 +3159,9 @@ function Today({
       {!plan && tomorrowPlan ? <Text style={[s.muted, { marginBottom: 12 }]}>Tomorrow's plan is ready ({tomorrowPlan.blocks.length} blocks). It shows up here once the day starts.</Text> : null}
       <TodayExtras />
 
-      <View style={s.toolRow}>
-        {[...favs.map((r) => [r.id, r.icon, shortOf(r)]), ['hub', 'apps-outline', 'All tools']].map(([id, ic, label]) => (
-          <Pressable key={id} onPress={() => onOpen(id)} style={s.tool}><Icon n={ic} size={22} /><Text style={[s.tabLabel, { color: C.text }]} numberOfLines={1}>{label}</Text></Pressable>
-        ))}
-      </View>
+      <Signals host="today" />
+      <Shelf host="today" />
+
 
       <PeakCard meta={meta} setMeta={setMeta} pk={pk} inPeak={inPeak} onSleep={() => onOpen('sleep')} />
 
@@ -2907,6 +3266,8 @@ function Habits({ habits, onToggle, onAdd, onDelete }) {
     <ScrollView contentContainerStyle={s.page} keyboardShouldPersistTaps="handled">
       <Text style={s.h1}>Habits</Text>
       <MomentumCard habits={habits} />
+      <Signals host="habits" />
+      <Shelf host="habits" />
       <Text style={[s.muted, { marginBottom: 14 }]}>Small actions, repeated daily, become who you are. Protect your streak.</Text>
       <CatChips value={cat} onChange={setCat} />
       <AddRow placeholder={`New ${catOf(cat).name} habit (e.g. Read 20 pages)`} onAdd={(t) => onAdd(t, cat)} />
@@ -3095,6 +3456,8 @@ function Learn({ cards, setCards, online, apiKey, onReview, onOpenSettings }) {
       <Pressable disabled={!due} onPress={onReview} style={[s.planBtn, { marginTop: 0, marginBottom: 14 }, !due && { opacity: 0.4 }]}>
         <Text style={s.planText}>{due ? `Review ${due} due card${due > 1 ? 's' : ''}` : 'Nothing due. Nice.'}</Text>
       </Pressable>
+      <Signals host="learn" />
+      <Shelf host="learn" />
       <Text style={s.fieldLabel}>Add a card</Text>
       <TextInput style={[s.addInput, { marginBottom: 8 }]} value={q} onChangeText={setQ} placeholder="Question or concept" placeholderTextColor={C.muted} keyboardAppearance="dark" />
       <AddRowInline value={a} onChange={setA} onAdd={add} placeholder="Answer" />
@@ -3139,6 +3502,7 @@ function Dump({ meta, onDump }) {
       {meta.models.slice(0, 15).map((m, i) => <View key={i} style={s.item}><Icon n="bulb-outline" size={18} color="#FBBF24" style={{ marginRight: 10 }} /><Text style={s.itemText}>{m}</Text></View>)}
       <Text style={s.section}>Archive</Text>
       {meta.archive.slice(0, 10).map((m, i) => <Text key={i} style={[s.muted, { marginBottom: 6 }]}>• {m}</Text>)}
+      <Shelf host="dump" />
     </ScrollView>
   );
 }
@@ -3339,7 +3703,8 @@ function Stats({ tasks, habits, activity, cards, meta, setMeta, online, onOpen, 
       </View>
 
       <Heatmap activity={activity} />
-      <Pressable onPress={() => onOpen('levers')} style={s.item}><Icon n="analytics-outline" size={18} color={C.accent} style={{ marginRight: 10 }} /><Text style={s.itemText}>Leverage insights: what drives your best days</Text><Icon n="chevron-forward" size={16} color={C.muted} /></Pressable>
+      <Signals host="stats" />
+      <Shelf host="stats" />
       <ReactionTest rt={meta.rt || []} onSave={(ms) => setMeta((mt) => ({ ...mt, rt: [...(mt.rt || []), ms].slice(-20) }))} />
       <SpanTest best={meta.span} onResult={(n) => setMeta((mt) => ({ ...mt, span: Math.max(mt.span || 0, n) }))} />
 
@@ -3435,6 +3800,8 @@ function Focus({ onDone, suggest, log, skills = [] }) {
         <Text style={[s.habitTitle, { flex: 0 }]}>Deep work rules</Text>
         <Text style={[s.muted, { marginTop: 8 }]}>1. Write the single outcome you want before you start.{'\n'}2. Phone in another room, notifications off.{'\n'}3. When distracted, note it on paper and return.{'\n'}4. After the session, rest 5 minutes away from screens.</Text>
       </View>
+      {!running && <Signals host="focus" />}
+      {!running && <Shelf host="focus" />}
     </ScrollView>
   );
 }
@@ -3460,6 +3827,8 @@ function Me({ profile, setProfile, memory, setMemory }) {
       <Text style={s.h1}>Your standing</Text>
       <Text style={[s.muted, { marginBottom: 6 }]}>Your coach permanently remembers everything here and uses it in every answer. The more honest you are, the sharper the advice.</Text>
       <Text style={[s.rank, { marginBottom: 14 }]}>Profile {filled}/{FIELDS.length} complete</Text>
+      <Signals host="me" />
+      <Shelf host="me" />
       {FIELDS.map(([k, label, ph, multi]) => (
         <View key={k} style={{ marginBottom: 14 }}>
           <Text style={s.fieldLabel}>{label}</Text>
@@ -3524,6 +3893,7 @@ const Bubble = React.memo(({ item, isLast, acts }) => {
 });
 
 function Coach({ online, hasKey, messages, thinking, mode, setMode, onSend, onOpenSettings, onClear, acts, draft }) {
+  const A = useApp();
   const [input, setInput] = useState('');
   useEffect(() => { if (draft && draft.text) setInput(draft.text); }, [draft && draft.n]);
   const listRef = useRef(null);
@@ -3565,6 +3935,9 @@ function Coach({ online, hasKey, messages, thinking, mode, setMode, onSend, onOp
                 <Text style={s.chipText}>{p}</Text>
               </Pressable>
             ))}
+            <Pressable onPress={() => A.go('playbooks')} style={s.suggest}>
+              <Text style={s.chipText}>Browse expert playbooks</Text>
+            </Pressable>
           </View>
         }
         ListFooterComponent={thinking ? (
@@ -3692,6 +4065,7 @@ export default function App() {
   const [capture, setCapture] = useState(false);
   const [coachDraft, setCoachDraft] = useState(null);
   const awardRef = useRef({});
+  const autoRef = useRef({});
   const { width: winW } = useWindowDimensions();
   const tasksRef = useRef(tasks); tasksRef.current = tasks;
   const habitsRef = useRef(habits); habitsRef.current = habits;
@@ -3789,6 +4163,8 @@ export default function App() {
       hours: { ...mt.hours, [h]: (mt.hours[h] || 0) + 1 },
       focusDays: { ...mt.focusDays, [dayKey(0)]: ((mt.focusDays || {})[dayKey(0)] || 0) + m },
       focusLog: [...(mt.focusLog || []), { ts: Date.now(), mins: m, intent }].slice(-80),
+      // A finished session is also real tracked time
+      timeLog: [{ id: uid(), start: Date.now() - m * 60000, end: Date.now(), mins: m, label: intent || 'Deep focus', cat: intent && GUESS.some(([, re]) => re.test(intent)) ? guessCat(intent) : 'career' }, ...(mt.timeLog || [])].slice(0, 500),
       ...(skillId ? { skills: (mt.skills || []).map((x) => (x.id === skillId ? { ...x, log: { ...x.log, [dayKey(0)]: ((x.log || {})[dayKey(0)] || 0) + m } } : x)) } : {}),
     }));
     setTimeout(maybeQuiz, 700);
@@ -3857,6 +4233,25 @@ export default function App() {
     if (cur < wg && nx >= wg) { setXp((x) => x + 5); bump(1); }
     if (cur >= wg && nx < wg) { setXp((x) => Math.max(0, x - 5)); bump(-1); }
   };
+  // Habits tick themselves when a tool records the real thing. Each habit is auto-ticked once a day, so unticking sticks.
+  useEffect(() => {
+    if (!loaded) return;
+    const t = dayKey(0), seen = (meta.linked || {})[t] || [], hits = [];
+    habits.forEach((h) => {
+      if (h.log.includes(t) || seen.includes(h.id) || autoRef.current[`${t}|${h.id}`]) return;
+      const a = autoFor(h);
+      if (a && a.hit(meta, t, h)) hits.push({ h, a });
+    });
+    if (!hits.length) return;
+    hits.forEach(({ h }) => { autoRef.current[`${t}|${h.id}`] = true; });
+    const ids = hits.map((x) => x.h.id);
+    setHabits((p) => p.map((x) => (ids.includes(x.id) && !x.log.includes(t) ? { ...x, log: [...x.log, t] } : x)));
+    setXp((x) => x + 5 * ids.length);
+    bump(ids.length);
+    ids.forEach((id) => syncBlocks('habitId', id, true));
+    setMeta((m) => ({ ...m, linked: { ...pruneDays(m.linked, 14), [t]: [...(((m.linked || {})[t]) || []), ...ids] } }));
+    showToast(hits.length === 1 ? `${hits[0].h.title} checked: ${hits[0].a.why}` : `${hits.length} habits checked from your activity`, () => ids.forEach((id) => toggleHabit(id)));
+  }, [meta, habits, loaded]);
   const saveJournal = (text, prompt) => {
     const k = dayKey(0), first = !(meta.journal || []).some((j) => j.date === k);
     setMeta((m) => ({ ...m, journal: [{ id: uid(), date: k, ts: Date.now(), text, prompt }, ...(m.journal || [])].slice(0, 300) }));
@@ -4082,15 +4477,16 @@ export default function App() {
   const acts = { del: deleteMsg, addTasks: addReplyTasks, regen, undoPlan, today: () => setTab('today') };
 
   const view = meta.lock && inPeak && !override && ['habits', 'coach', 'me', 'learn'].includes(tab) ? 'gate' : tab;
-  const hl = SUB_IDS.includes(tab) ? 'today' : tab;
-  const go = (id) => { if (SUB_IDS.includes(id)) setBackTo(id === 'hub' ? 'today' : tab === 'hub' ? 'hub' : SUB_IDS.includes(tab) ? backTo : 'today'); setTab(id); };
+  const hl = SUB_IDS.includes(tab) ? (HOME[tab] || backTo) : tab;
+  // Opening a tool remembers the feature you came from; hopping tool to tool keeps that origin
+  const go = (id) => { if (SUB_IDS.includes(id)) setBackTo(SUB_IDS.includes(tab) ? backTo : tab); setTab(id); };
   const back = () => setTab(backTo);
   const openDraft = (text) => { setMode('all'); setCoachDraft({ text, n: Date.now() }); setTab('coach'); };
   const analyze = (t) => { setMode('all'); setTab('coach'); send(t); };
   const TABS = [{ id: 'today', icon: 'checkmark-circle', label: 'Today' }, { id: 'habits', icon: 'flame', label: 'Habits' }, { id: 'focus', icon: 'timer', label: 'Focus' }, { id: 'learn', icon: 'albums', label: 'Learn' }, { id: 'dump', icon: 'create', label: 'Dump' }, { id: 'stats', icon: 'stats-chart', label: 'Stats' }, { id: 'coach', icon: 'chatbubble-ellipses', label: 'Coach' }, { id: 'me', icon: 'person', label: 'Me' }];
 
   const ctx = {
-    meta, setMeta, tasks, habits, cards, activity, xp, profile, memory, online, thinking, apiKey, pk, plan, tick, backTo, go, award,
+    meta, setMeta, tasks, habits, cards, activity, xp, profile, memory, online, thinking, apiKey, pk, plan, tick, backTo, go, award, tool: tab,
     toast: showToast, analyze, draft: openDraft, setXp, bump, addTask, deleteTask, starTask, flagTask, toggleTask, addHabit, saveJournal,
     routineToggle, routineSteps, routineDone, finishShutdown, autoPlanNow, capture: () => setCapture(true),
   };
@@ -4108,7 +4504,7 @@ export default function App() {
             {online && (
               <View style={[s.badge, winW < 440 && { paddingHorizontal: 8 }]}><View style={s.badgeDot} />{winW >= 440 && <Text style={s.badgeText}>Online</Text>}</View>
             )}
-            <Pressable onPress={() => go('hub')} style={[s.gear, { marginLeft: 6 }]} accessibilityLabel="All tools"><Icon n="apps-outline" size={22} color={C.muted} /></Pressable>
+            <Pressable onPress={() => go('search')} style={[s.gear, { marginLeft: 6 }]} accessibilityLabel="Search"><Icon n="search-outline" size={22} color={C.muted} /></Pressable>
             <Pressable onPress={() => setShowSettings(true)} style={[s.gear, { marginLeft: 6 }]} accessibilityLabel="Settings"><Icon n="settings-outline" size={22} color={C.muted} /></Pressable>
           </View>
         </View>
@@ -4270,13 +4666,10 @@ const s = StyleSheet.create({
   stepBtn: { minWidth: 36, height: 36, borderRadius: 10, borderWidth: 1, borderColor: C.border, backgroundColor: C.raised, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 8 },
   stepVal: { color: C.text, fontSize: 18, fontWeight: '700', minWidth: 90, textAlign: 'center', fontVariant: ['tabular-nums'] },
   planRow: { flexDirection: 'row', alignItems: 'center', padding: 10, borderRadius: 12, borderWidth: 1, borderColor: 'transparent', marginBottom: 4 },
-  toolRow: { flexDirection: 'row', marginBottom: 12, marginRight: -6 },
-  tool: { flex: 1, alignItems: 'center', backgroundColor: C.surface, borderWidth: 1, borderColor: C.border, borderRadius: 14, paddingVertical: 10, marginRight: 6 },
   glass: { width: 18, height: 22, margin: 3, borderRadius: 5, borderWidth: 1.5, borderColor: C.disabled },
   applied: { marginTop: 6, backgroundColor: C.surface, borderWidth: 1, borderColor: '#14532D', borderRadius: 14, padding: 12 },
   toastWrap: { position: 'absolute', left: 16, right: 16, alignItems: 'center' },
   toast: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#1C1C20', borderWidth: 1, borderColor: C.border, borderRadius: 14, paddingHorizontal: 16, paddingVertical: 12, width: '100%', maxWidth: 520, elevation: 8 },
   toastBtn: { color: '#60A5FA', fontWeight: '700', fontSize: 14, marginLeft: 12 },
-  hubCard: { width: '48%', marginRight: '2%', backgroundColor: C.surface, borderWidth: 1, borderColor: C.border, borderRadius: 14, padding: 12, marginBottom: 8 },
   fab: { position: 'absolute', right: 18, width: 52, height: 52, borderRadius: 26, backgroundColor: C.accent, alignItems: 'center', justifyContent: 'center', elevation: 6, shadowColor: '#000', shadowOpacity: 0.4, shadowRadius: 6, shadowOffset: { width: 0, height: 3 } },
 });
